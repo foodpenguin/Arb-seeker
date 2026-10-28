@@ -17,18 +17,17 @@
 use std::future::Future;
 
 use alloy::{
-    primitives::{Address, Bytes, U256, address},
-    providers::Provider,
+    primitives::{Address, Bytes, U256},
     rpc::types::TransactionRequest,
-    sol,
-    sol_types::SolCall,
 };
 use anyhow::{Context, Result};
 use futures::future::join_all;
 use tracing::{info, warn};
 
+pub use crate::gates::{DailyBudget, Gates, deadline_blocks, gas_cost_usd, l1_fee_wei};
 use crate::{
-    executor::{Executor, Inflight, MinProfitSlot, Payload, SendRequest},
+    actor::ExecHandle,
+    executor::{Inflight, MinProfitSlot, Payload, SendRequest, TxKey},
     num::u256_f64,
 };
 
@@ -54,67 +53,6 @@ impl BidPolicy {
         let budget_usd = (profit_usd * self.share).min(net_usd - floor_usd).max(0.0);
         let extra = budget_usd / eth_usd * 1e18 / gas as f64;
         (self.base_priority_wei + extra as u128).min(self.max_priority_wei.max(self.base_priority_wei))
-    }
-}
-
-/// Gas cost in USD of `gas` at `base_fee + priority`.
-pub fn gas_cost_usd(gas: u64, base_fee_wei: u128, priority_wei: u128, eth_usd: f64) -> f64 {
-    gas as f64 * (base_fee_wei + priority_wei) as f64 / 1e18 * eth_usd
-}
-
-sol! {
-    interface IGasPriceOracle { function getL1FeeUpperBound(uint256 unsignedTxSize) external view returns (uint256); }
-}
-/// OP-stack GasPriceOracle predeploy (Base).
-const GAS_PRICE_ORACLE: Address = address!("420000000000000000000000000000000000000F");
-
-/// The L1 data fee (upper bound) of a tx carrying `calldata_len` bytes: paid whatever the priority.
-pub async fn l1_fee_wei<P: Provider>(p: &P, calldata_len: usize) -> Result<U256> {
-    let data: Bytes = IGasPriceOracle::getL1FeeUpperBoundCall { unsignedTxSize: U256::from(calldata_len + 100) }.abi_encode().into();
-    let out = p.call(TransactionRequest::default().to(GAS_PRICE_ORACLE).input(data.into())).await?;
-    Ok(IGasPriceOracle::getL1FeeUpperBoundCall::abi_decode_returns(&out)?)
-}
-
-/// A deadline in seconds as blocks at the observed block time (works across a block-time change,
-/// e.g. 2 s -> 200 ms, without config edits).
-pub fn deadline_blocks(deadline_secs: f64, block_time_secs: f64) -> u64 {
-    (deadline_secs / block_time_secs.max(0.05)).ceil().max(1.0) as u64
-}
-
-/// What `ArbExecutor::send` checks before every send.
-pub struct Gates<'a> {
-    pub kill_switch_file: &'a str,
-    pub budget: &'a mut DailyBudget,
-    pub daily_cap_usd: f64,
-    pub now_unix: u64,
-}
-
-/// Gas burned by failed (reverted) txs per UTC day. Successful sends are not charged: they paid
-/// for their own gas, and charging them would block profitable arbs on a busy day.
-#[derive(Debug, Default)]
-pub struct DailyBudget {
-    day: u64,
-    spent_usd: f64,
-}
-
-impl DailyBudget {
-    fn roll(&mut self, unix_secs: u64) {
-        let day = unix_secs / 86_400;
-        if day != self.day {
-            (self.day, self.spent_usd) = (day, 0.0);
-        }
-    }
-
-    /// The actual cost of a tx that reverted on-chain.
-    pub fn charge(&mut self, unix_secs: u64, usd: f64) {
-        self.roll(unix_secs);
-        self.spent_usd += usd;
-    }
-
-    /// Would a send that may cost `usd` (if it reverts) stay within `cap_usd` today?
-    pub fn allows(&mut self, unix_secs: u64, usd: f64, cap_usd: f64) -> bool {
-        self.roll(unix_secs);
-        self.spent_usd + usd <= cap_usd
     }
 }
 
@@ -252,19 +190,10 @@ impl ArbExecutor {
     /// here, not left to each strategy): the kill-switch file, the executor's failure cooldown, and
     /// the daily budget for gas burned by reverts (what this tx would burn if it reverted: L2 gas
     /// at its priority plus the L1 fee). None = not sent (logged).
-    #[allow(clippy::too_many_arguments)]
-    pub async fn send<P: alloy::providers::Provider>(&self, e: &mut Executor<P>, c: &Candidate, t: &SendTerms, gates: Gates<'_>, block: u64, deadline_block: u64) -> Result<Option<Inflight>> {
-        if std::path::Path::new(gates.kill_switch_file).exists() {
-            info!(strategy = self.name, "arb: kill switch file present; not sending");
-            return Ok(None);
-        }
-        if e.halted() {
-            info!(strategy = self.name, "arb: sending paused (failure cooldown); not sending");
-            return Ok(None);
-        }
+    pub async fn send(&self, e: &ExecHandle, c: &Candidate, t: &SendTerms, mut gates: Gates<'_>, block: u64, deadline_block: u64) -> Result<Option<Inflight>> {
         let worst_usd = gas_cost_usd(c.gas_est, self.base_fee_wei, t.priority_fee_wei, self.eth_usd) + c.l1_usd;
-        if !gates.budget.allows(gates.now_unix, worst_usd, gates.daily_cap_usd) {
-            info!(strategy = self.name, worst_usd, budget_usd = gates.daily_cap_usd, "arb: daily gas budget for reverts used up; not sending");
+        if let Err(why) = gates.check(e.halted(), worst_usd) {
+            info!(strategy = self.name, reason = %why, "arb: not sending");
             return Ok(None);
         }
         Ok(Some(e.send(self.request(c, t, block, deadline_block)).await?))
@@ -278,8 +207,8 @@ impl ArbExecutor {
             gas_limit: t.gas_limit,
             base_fee_wei: self.base_fee_wei,
             priority_fee_wei: t.priority_fee_wei,
-            market: usize::MAX,
-            user: self.contract,
+            // One key per contract: a strategy never has two arbs through it in flight.
+            key: TxKey::of_address(0, self.contract),
             block,
             deadline_block,
         }
@@ -322,23 +251,6 @@ mod tests {
     /// Profit token = USD with 6 decimals.
     fn usd(x: U256) -> f64 {
         u256_f64(x) / 1e6
-    }
-
-    #[test]
-    fn daily_budget_caps_failed_spend_and_resets_at_utc_midnight() {
-        let mut b = DailyBudget::default();
-        assert!(b.allows(10, 4.0, 5.0));
-        b.charge(10, 4.5);
-        assert!(!b.allows(20, 1.0, 5.0), "4.5 + 1 > 5");
-        assert!(b.allows(20, 0.5, 5.0));
-        assert!(b.allows(86_400 + 1, 4.9, 5.0), "a new day starts from zero");
-    }
-
-    #[test]
-    fn deadlines_follow_the_block_time() {
-        assert_eq!(deadline_blocks(4.0, 2.0), 2);
-        assert_eq!(deadline_blocks(4.0, 0.2), 20, "200 ms blocks");
-        assert_eq!(deadline_blocks(0.1, 2.0), 1, "at least one block");
     }
 
     #[tokio::test]

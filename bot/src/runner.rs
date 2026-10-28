@@ -3,7 +3,9 @@
 //! - the new-block signal: WS newHeads (heads::spawn_ws_many); when it is quiet for `ws_quiet`,
 //!   HTTP polling every `poll_ms` takes over until WS speaks again;
 //! - the flashblocks stream (same-block mode), handed to the strategy in batches;
-//! - per block, the executor's receipt poll for the tx in flight, with the gas spent so far.
+//! - the executor as its own task (`onchain_core::actor`): it polls receipts on every head the
+//!   driver sees, and each settled tx reaches the strategy's `on_outcome` with the gas spent so
+//!   far, without the block loop ever waiting for a receipt.
 //!
 //! Hooks return `Err` only for fatal errors (e.g. the journal cannot be written); a strategy logs
 //! and swallows recoverable ones (a failed quote pass, a flaky endpoint) itself.
@@ -16,6 +18,7 @@ use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
 
 use crate::{
+    actor::{self, ExecHandle, Settled},
     executor::{Executor, Inflight, Outcome},
     flashblocks::Flashblock,
     heads::{Head, http_head},
@@ -26,13 +29,12 @@ pub trait OpportunitySource<P: Provider + Clone> {
     /// Short name, used as the log prefix ("aero: ...").
     fn name(&self) -> &'static str;
 
-    /// A new sealed head (deduplicated, strictly increasing), after the executor's receipt poll.
-    /// `exec` is `None` in observe-only mode.
-    fn on_block(&mut self, p: &P, head: &Head, exec: Option<&mut Executor<P>>) -> impl Future<Output = Result<()>> + Send;
+    /// A new sealed head (deduplicated, strictly increasing). `exec` is `None` in observe-only mode.
+    fn on_block(&mut self, p: &P, head: &Head, exec: Option<&ExecHandle>) -> impl Future<Output = Result<()>> + Send;
 
     /// Flashblocks of the in-progress block: `first`, plus whatever is queued behind it in `rx`.
     /// `last_block` is the latest sealed head the driver has seen.
-    fn on_flashblocks(&mut self, p: &P, first: Flashblock, rx: &mut mpsc::Receiver<Flashblock>, exec: Option<&mut Executor<P>>, last_block: u64) -> impl Future<Output = Result<()>> + Send;
+    fn on_flashblocks(&mut self, p: &P, first: Flashblock, rx: &mut mpsc::Receiver<Flashblock>, exec: Option<&ExecHandle>, last_block: u64) -> impl Future<Output = Result<()>> + Send;
 
     /// The tx in flight resolved (included, reverted, dropped or expired). `gas_spent_total_wei`
     /// counts every included tx so far; `cooldown_started` is true when this outcome put the
@@ -48,16 +50,25 @@ pub struct RunnerOpts {
     pub ws_quiet: Duration,
 }
 
-/// Runs `strategy` until a hook returns a fatal error.
-pub async fn run<P: Provider + Clone, S: OpportunitySource<P>>(
+/// Runs `strategy` until a hook returns a fatal error. `exec` (live mode) is started as its own
+/// task here.
+pub async fn run<P: Provider + Clone + Send + Sync + 'static, S: OpportunitySource<P>>(
     strategy: &mut S,
     p: P,
-    mut exec: Option<Executor<P>>,
+    exec: Option<Executor<P>>,
     mut heads: watch::Receiver<Option<Head>>,
     mut fb: Option<mpsc::Receiver<Flashblock>>,
     opts: RunnerOpts,
 ) -> Result<()> {
     let name = strategy.name();
+    let (blocks_tx, blocks_rx) = watch::channel(0u64);
+    let (exec, mut settled) = match exec {
+        Some(e) => {
+            let (h, s) = actor::spawn(e, blocks_rx);
+            (Some(h), Some(s))
+        }
+        None => (None, None),
+    };
     let mut last_block = 0u64;
     let mut gas_spent_wei = U256::ZERO;
     let (mut ws_quiet, mut heads_open) = (false, true);
@@ -97,9 +108,19 @@ pub async fn run<P: Provider + Clone, S: OpportunitySource<P>>(
                     }
                 }
             }
+            Some(s) = next_settled(&mut settled) => {
+                let Settled { inflight, outcome, cooldown_started } = s;
+                if let Outcome::Included { gas_used, effective_gas_price, l1_fee_wei, .. } = &outcome {
+                    gas_spent_wei += U256::from(*gas_used) * U256::from(*effective_gas_price) + U256::from(*l1_fee_wei);
+                }
+                // Lost races / expiries are normal; a burst pauses sending for a while
+                // (executor::FailurePolicy), then it resumes by itself.
+                strategy.on_outcome(last_block, &inflight, &outcome, gas_spent_wei, cooldown_started)?;
+                continue;
+            }
             Some(first) = next_fb(&mut fb) => {
                 let rx = fb.as_mut().expect("a flashblock came from it");
-                strategy.on_flashblocks(&p, first, rx, exec.as_mut(), last_block).await?;
+                strategy.on_flashblocks(&p, first, rx, exec.as_ref(), last_block).await?;
                 continue;
             }
         };
@@ -107,26 +128,18 @@ pub async fn run<P: Provider + Clone, S: OpportunitySource<P>>(
             continue;
         }
         last_block = head.number;
-        let block = head.number;
-        if let Some(e) = exec.as_mut() {
-            let was_cooling = e.halted();
-            match e.poll(block).await {
-                Ok(Some((inf, outcome))) => {
-                    if let Outcome::Included { gas_used, effective_gas_price, l1_fee_wei, .. } = &outcome {
-                        gas_spent_wei += U256::from(*gas_used) * U256::from(*effective_gas_price) + U256::from(*l1_fee_wei);
-                    }
-                    // Lost races / expiries are normal; a burst pauses sending for a while
-                    // (executor::FailurePolicy), then it resumes by itself.
-                    let cooldown_started = !was_cooling && e.halted();
-                    strategy.on_outcome(block, &inf, &outcome, gas_spent_wei, cooldown_started)?;
-                }
-                Ok(None) => {}
-                Err(err) => warn!(error = %err, "{}: receipt poll failed", name),
-            }
-        }
-        strategy.on_block(&p, &head, exec.as_mut()).await?;
+        // The executor task polls its receipts on this head.
+        blocks_tx.send_replace(head.number);
+        strategy.on_block(&p, &head, exec.as_ref()).await?;
         // A long pass must not read as quiet WS heads.
         quiet_at = quiet_at.max(tokio::time::Instant::now() + opts.ws_quiet);
+    }
+}
+
+async fn next_settled(rx: &mut Option<mpsc::UnboundedReceiver<Settled>>) -> Option<Settled> {
+    match rx {
+        Some(r) => r.recv().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -163,13 +176,13 @@ mod tests {
         fn name(&self) -> &'static str {
             "probe"
         }
-        async fn on_block(&mut self, _p: &P, head: &Head, _exec: Option<&mut Executor<P>>) -> Result<()> {
+        async fn on_block(&mut self, _p: &P, head: &Head, _exec: Option<&ExecHandle>) -> Result<()> {
             self.seen.push(Ev::Block(head.number));
             let _ = self.signal.send(());
             anyhow::ensure!(head.number != self.stop_at, "stop");
             Ok(())
         }
-        async fn on_flashblocks(&mut self, _p: &P, first: Flashblock, _rx: &mut mpsc::Receiver<Flashblock>, _exec: Option<&mut Executor<P>>, last_block: u64) -> Result<()> {
+        async fn on_flashblocks(&mut self, _p: &P, first: Flashblock, _rx: &mut mpsc::Receiver<Flashblock>, _exec: Option<&ExecHandle>, last_block: u64) -> Result<()> {
             self.seen.push(Ev::Flash { block: first.block, index: first.index, last_block });
             let _ = self.signal.send(());
             Ok(())

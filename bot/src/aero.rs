@@ -49,6 +49,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::{
+    actor::ExecHandle,
     arb_exec::{ArbExecutor, BidPolicy, Candidate},
     config::{AeroConfig, AeroFunding, Config},
     chain::multicall,
@@ -534,11 +535,11 @@ fn factory_allowed_call(factory: Address, factory_list: bool) -> Bytes {
 
 impl<'a> Aero<'a> {
     /// Validates the config, pre-flights the contract when live, loads the GridQuoter code.
-    pub async fn start<P: Provider + Clone>(cfg: &'a Config, p: &P, exec: Option<&Executor<P>>, same_block: bool) -> Result<Self> {
+    pub async fn start<P: Provider + Clone>(cfg: &'a Config, p: &P, live_wallet: Option<Address>, same_block: bool) -> Result<Self> {
         let a = &cfg.aero;
         validate(a)?;
         let mut journal = std::fs::OpenOptions::new().create(true).append(true).open(&a.journal_path).with_context(|| format!("opening journal {}", a.journal_path))?;
-        if exec.is_some() && a.contract.is_none() {
+        if live_wallet.is_some() && a.contract.is_none() {
             bail!("--live needs [aero] contract");
         }
         let mut factory_list = true;
@@ -548,8 +549,8 @@ impl<'a> Aero<'a> {
             if !factory_list {
                 info!(contract = %c, "aero: contract predates the separate factory allowlist; reading factories from allowedTarget");
             }
-            if let Some(e) = exec {
-                retry("pre-flight", || preflight(p, a, c, e.address, factory_list)).await?;
+            if let Some(w) = live_wallet {
+                retry("pre-flight", || preflight(p, a, c, w, factory_list)).await?;
             }
         }
         log_funding(p, a).await;
@@ -557,8 +558,8 @@ impl<'a> Aero<'a> {
         let code: Bytes = art["deployedBytecode"]["object"].as_str().context("quoter: no deployedBytecode")?.parse()?;
         let mut quoter = StateOverride::default();
         quoter.insert(SIM_QUOTER, AccountOverride { code: Some(code), ..Default::default() });
-        info!(live = exec.is_some(), contract = ?a.contract, same_block, "aero: start");
-        writeln!(journal, "{}", json!({ "kind": "aero_start", "live": exec.is_some(), "contract": a.contract, "same_block": same_block }))?;
+        info!(live = live_wallet.is_some(), contract = ?a.contract, same_block, "aero: start");
+        writeln!(journal, "{}", json!({ "kind": "aero_start", "live": live_wallet.is_some(), "contract": a.contract, "same_block": same_block }))?;
         let state = TickState {
             usd: a.loan_tokens.iter().map(|l| if l.is_priced() { cfg.exec.eth_usd_fallback.max(1.0) } else { 1.0 }).collect(),
             logged: HashMap::new(),
@@ -591,7 +592,7 @@ impl<P: Provider + Clone> OpportunitySource<P> for Aero<'_> {
         "aero"
     }
 
-    async fn on_block(&mut self, p: &P, head: &Head, exec: Option<&mut Executor<P>>) -> Result<()> {
+    async fn on_block(&mut self, p: &P, head: &Head, exec: Option<&ExecHandle>) -> Result<()> {
         let a = &self.cfg.aero;
         let block = head.number;
         if self.last_discovery == 0 || block >= self.last_discovery + DISCOVERY_EVERY {
@@ -624,15 +625,15 @@ impl<P: Provider + Clone> OpportunitySource<P> for Aero<'_> {
             info!(blocks = s.blocks, broken = s.broken, passes = s.passes, moved = s.moved, failed = s.failed, learned = self.sb.learned.len(), "aero: same-block stats");
             writeln!(self.journal, "{}", json!({ "kind": "aero_same_block", "block": block, "stats": s, "learned": self.sb.learned.len() }))?;
         }
-        let cooling = exec.as_ref().is_some_and(|e| e.halted());
+        let cooling = exec.is_some_and(|e| e.halted());
         if let Err(err) = tick(self.cfg, p, head, &self.new_ladder, &self.paths, exec, cooling, &mut self.state, &mut self.journal, &At::Sealed(BlockId::number(head.number)), &mut None).await {
             warn!(error = %err, block, "aero: tick failed");
         }
         Ok(())
     }
 
-    async fn on_flashblocks(&mut self, p: &P, first: Flashblock, rx: &mut mpsc::Receiver<Flashblock>, exec: Option<&mut Executor<P>>, last_block: u64) -> Result<()> {
-        let cooling = exec.as_ref().is_some_and(|e| e.halted());
+    async fn on_flashblocks(&mut self, p: &P, first: Flashblock, rx: &mut mpsc::Receiver<Flashblock>, exec: Option<&ExecHandle>, last_block: u64) -> Result<()> {
+        let cooling = exec.is_some_and(|e| e.halted());
         if let Err(err) = on_flashblocks(self.cfg, p, &mut self.sb, first, rx, &self.watch, &self.new_ladder, &self.paths, exec, cooling, last_block, &mut self.state, &mut self.journal).await {
             warn!(error = %err, "aero: same-block pass failed");
         }
@@ -658,8 +659,8 @@ impl<P: Provider + Clone> OpportunitySource<P> for Aero<'_> {
 
 /// Starts the Aero strategy and hands it to the generic driver (`runner::run`, which owns the
 /// heads / HTTP-polling / flashblocks scheduling). `fb` = Some enables same-block mode.
-pub async fn run<P: Provider + Clone>(cfg: &Config, p: P, exec: Option<Executor<P>>, heads: tokio::sync::watch::Receiver<Option<Head>>, fb: Option<mpsc::Receiver<Flashblock>>) -> Result<()> {
-    let mut strategy = Aero::start(cfg, &p, exec.as_ref(), fb.is_some()).await?;
+pub async fn run<P: Provider + Clone + Send + Sync + 'static>(cfg: &Config, p: P, exec: Option<Executor<P>>, heads: tokio::sync::watch::Receiver<Option<Head>>, fb: Option<mpsc::Receiver<Flashblock>>) -> Result<()> {
+    let mut strategy = Aero::start(cfg, &p, exec.as_ref().map(|e| e.address), fb.is_some()).await?;
     runner::run(&mut strategy, p, exec, heads, fb, RunnerOpts { poll_ms: cfg.aero.poll_ms, ws_quiet: WS_QUIET }).await
 }
 
@@ -678,7 +679,7 @@ async fn on_flashblocks<P: Provider + Clone>(
     watch: &Watch,
     new_ladder: &[U256],
     paths: &[Path],
-    exec: Option<&mut Executor<P>>,
+    exec: Option<&ExecHandle>,
     cooling: bool,
     last_block: u64,
     state: &mut TickState,
@@ -1229,7 +1230,7 @@ async fn tick<P: Provider + Clone>(
     head: &Head,
     new_ladder: &[U256],
     paths: &[Path],
-    exec: Option<&mut Executor<P>>,
+    exec: Option<&ExecHandle>,
     cooling: bool,
     state: &mut TickState,
     journal: &mut std::fs::File,
@@ -1370,7 +1371,7 @@ async fn tick<P: Provider + Clone>(
     let ae = ArbExecutor {
         name: "aero",
         contract,
-        from: exec.as_ref().map_or(cfg.exec.executor, |e| e.address),
+        from: exec.map_or(cfg.exec.executor, |e| e.address()),
         gas_limit: a.gas_limit,
         base_fee_wei: head.base_fee,
         bid: bid_policy(a),
@@ -1400,18 +1401,9 @@ async fn tick<P: Provider + Clone>(
         }
     }
     let call = |tx: TransactionRequest| call_at(p, tx, exact_at);
-    let may_send = !cooling && !std::path::Path::new(&cfg.exec.kill_switch_file).exists() && exec.as_ref().is_some_and(|e| !e.halted() && e.inflight.is_none());
-    let mut exec = exec;
-    // The balance too: the node wants gas_limit x maxFee up front, which a bid raises.
-    let nonce = async {
-        match exec.as_mut() {
-            Some(e) if may_send => Some((e.sync_nonce().await, e.balance().await)),
-            _ => None,
-        }
-    };
     // The L1 data fee (one read for the largest calldata) is paid whatever the priority: in the net.
     let l1 = crate::arb_exec::l1_fee_wei(p, cands.iter().map(|c| c.calldata.len()).max().unwrap_or(0));
-    let (exact, nonce, l1) = tokio::join!(ae.exact(&cands, call), nonce, l1);
+    let (exact, l1) = tokio::join!(ae.exact(&cands, call), l1);
     let l1_usd = l1.map_or(0.0, |w| math::u256_f64(w) / 1e18 * eth_usd);
     for c in &mut cands {
         c.l1_usd = l1_usd;
@@ -1440,17 +1432,14 @@ async fn tick<P: Provider + Clone>(
     // ---- send (live only; kill switch, cooldown, one tx in flight, daily gas budget for reverts;
     // the running gas total is in aero_outcome)
     let Some(e) = exec else { return Ok(()) };
-    let balance = match nonce {
-        Some((Ok(_), Ok(b))) => math::u256_f64(b),
-        Some((Err(err), _)) => {
-            warn!(error = %err, "aero: nonce sync failed; not sending");
-            return Ok(());
-        }
-        Some((_, Err(err))) => {
-            warn!(error = %err, "aero: balance check failed; not sending");
-            return Ok(());
-        }
-        None => return Ok(()), // not allowed to send right now (see may_send)
+    if cooling || !e.can_send() {
+        return Ok(()); // cooling down, or the previous arb is still in flight
+    }
+    // The node wants gas_limit x maxFee up front, which a bid raises: the executor's background
+    // balance reading, minus what is in flight.
+    let Some(balance) = e.spendable().map(|b| math::u256_f64(b)) else {
+        warn!("aero: no hot-wallet balance reading yet; not sending");
+        return Ok(());
     };
     let Some(t) = ae.terms(c, &pk, balance, usd, call).await else { return Ok(()) };
     // Daily gas budget: what this tx burns if it reverts (L2 gas at its priority + L1 fee).
@@ -1802,22 +1791,29 @@ mod e2e {
         assert_eq!(funders[pk.index].name(), "v4", "equal profit: the cheaper V4 entry wins");
         let bcast = Broadcaster::new(reqwest::Client::new(), vec![("anvil".into(), url.to_string())]);
         let policy = FailurePolicy { max_in_window: 3, window: std::time::Duration::from_secs(600), cooldown: std::time::Duration::from_secs(600) };
-        let mut ex = Executor::new(p.clone(), hot.clone(), 8453, bcast, policy);
+        let ex = Executor::new(p.clone(), hot.clone(), 8453, bcast, policy);
         let balance = math::u256_f64(ex.balance().await.unwrap());
+        // The executor runs as its own task, as in the bot; this test announces the blocks.
+        let (blocks_tx, blocks_rx) = tokio::sync::watch::channel(n);
+        let (ex, mut settled) = crate::actor::spawn(ex, blocks_rx);
         let t = ae.terms(&cands[pk.index], &pk, balance, usd, call).await.expect("the wallet covers it");
         let mut budget = DailyBudget::default();
         let kill = std::env::temp_dir().join(format!("arb-e2e-no-kill-{}", std::process::id()));
         let gates = Gates { kill_switch_file: kill.to_str().unwrap(), budget: &mut budget, daily_cap_usd: 5.0, now_unix: 0 };
-        let inf = ae.send(&mut ex, &cands[pk.index], &t, gates, n, n + 20).await.unwrap().expect("sent");
-        let mut outcome = None;
-        for _ in 0..30 {
-            if let Some((_, o)) = ex.poll(n + 1).await.unwrap() {
-                outcome = Some(o);
+        let inf = ae.send(&ex, &cands[pk.index], &t, gates, n, n + 20).await.unwrap().expect("sent");
+        // Each announced block makes the task look for the receipt (the fork may take a moment
+        // to mine it).
+        let mut got = None;
+        for _ in 0..50 {
+            blocks_tx.send_replace(p.get_block_number().await.unwrap());
+            if let Ok(s) = tokio::time::timeout(std::time::Duration::from_millis(400), settled.recv()).await {
+                got = s;
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
-        let Some(Outcome::Included { success, gas_used, .. }) = outcome else { panic!("no outcome: {outcome:?}") };
+        let s = got.expect("settled in time");
+        assert_eq!(s.inflight.hash, inf.hash);
+        let Outcome::Included { success, gas_used, .. } = s.outcome else { panic!("no outcome: {:?}", s.outcome) };
         assert!(success, "the arb reverted");
         let q = IErc20E::balanceOfCall(receiver).abi_encode();
         let got = U256::from_be_slice(&p.call(TransactionRequest::default().with_to(USDC).with_input(q)).await.unwrap()[..32]);
@@ -1827,7 +1823,7 @@ mod e2e {
         // 4. The gates hold: a kill-switch file stops the next send before the executor sees it.
         std::fs::write(&kill, b"stop").unwrap();
         let gates = Gates { kill_switch_file: kill.to_str().unwrap(), budget: &mut budget, daily_cap_usd: 5.0, now_unix: 0 };
-        assert!(ae.send(&mut ex, &cands[pk.index], &t, gates, n, n + 20).await.unwrap().is_none(), "kill switch");
+        assert!(ae.send(&ex, &cands[pk.index], &t, gates, n, n + 20).await.unwrap().is_none(), "kill switch");
         let _ = std::fs::remove_file(&kill);
     }
 }
