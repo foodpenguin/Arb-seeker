@@ -17,13 +17,17 @@ repay, in one transaction, with no capital of your own) is the example strategy.
 - **Generic strategy driver** (`runner::run` + `OpportunitySource`): new heads over WebSocket with
   HTTP polling while WS is quiet, batches of Base flashblocks for same-block work, per-block receipt
   polling of the transaction in flight, gas accounting.
+- **Generic send pipeline** (`arb_exec::ArbExecutor`): exact check of every candidate against the
+  contract in parallel, pick (floor first, then net), optional priority-fee bid re-checked at its
+  own priority, send terms the hot wallet can cover. A strategy supplies the candidates, how to call
+  and how to value its profit token.
 - **Two funding models** (`flash.rs`), deliberately separate traits:
   - `FlashLoan` — borrow a fixed amount, repay amount + fee inside the callback (`MorphoBlue`, 0 fee);
   - `FlashAccounting` — take now, settle the net before `unlock` returns (`UniswapV4` PoolManager).
 - **`AeroMigrationArb.sol`**: the arb body does not know its funder; `arb()` (Morpho) and
   `arbFlashAccounting()` (V4) take identical arguments. Each callback only runs inside an arb funded
-  by that very source, once; executor-only; owner-allowlisted swap targets (pools are verified
-  against their factory); minimum-profit check. `[aero] funding = "morpho" | "v4" | "auto"`.
+  by that very source, once; executor-only; two owner allowlists, routers (`allowedTarget`) and
+  pool factories (`allowedFactory`, pools are verified against them); minimum-profit check. `[aero] funding = "morpho" | "v4" | "auto"`.
 - **Aero example**: pool discovery from factories and a registry, batched grid quoting by state
   override (`GridQuoter`), greedy split across V2 and CL pools, exact check of the real transaction
   before sending, optional same-block mode that replays the in-progress block's relevant txs.
@@ -35,6 +39,7 @@ repay, in one transaction, with no capital of your own) is the example strategy.
 ```
 bot/src/
   runner.rs      OpportunitySource + the generic driver
+  arb_exec.rs    ArbExecutor: exact check -> pick -> bid -> send terms
   flash.rs       FlashLoan / FlashAccounting (MorphoBlue, UniswapV4)
   aero.rs        Aero merger arbitrage (example strategy)
   executor.rs    signing, broadcasting, nonce file, cooldown
@@ -60,12 +65,15 @@ cargo build --release
 ./target/release/arb-bot -c config.local.toml         # observe only: nothing is sent
 ```
 
-`--live` needs `exec.keystore` and a deployed `[aero] contract`, and is always started by you.
+`--live` needs `[exec] mode = "live"` in the config as well, `exec.keystore` and a deployed
+`[aero] contract`, and is always started by you. Reverted arbs are capped per UTC day by
+`[exec] daily_gas_budget_usd`.
 
 ## Extending
 
 - **Another strategy**: implement `runner::OpportunitySource` (`on_block`, `on_flashblocks`,
-  `on_outcome`), then call `runner::run`. Return `Err` from a hook only for fatal errors.
+  `on_outcome`), then call `runner::run`. Return `Err` from a hook only for fatal errors. Send
+  through `arb_exec::ArbExecutor` (build `Candidate`s, supply `call` and a USD valuation), as Aero does.
 - **Another capital source**: implement `FlashLoan` or `FlashAccounting`, and give the contract an
   entry point with the same arguments as the existing ones plus a callback bound to that source.
 

@@ -83,7 +83,10 @@ struct ArbStep {
 ///        unpauses or moves funds; two-step ownership;
 ///      - each funding callback only runs inside our own arb funded by that very source, once
 ///        (transient funding tag + the funder as sender); an entry whose callback never ran reverts;
-///      - swap steps may only call owner-allowlisted targets, with exact allowances reset to zero;
+///      - router steps (kind 0) may only call owner-allowlisted routers (`allowedTarget`), with exact
+///        allowances reset to zero; pool steps (kinds 1-3) only pools of owner-allowlisted
+///        factories (`allowedFactory`), verified against the factory. Two lists, so a factory is
+///        never a router target (approve + arbitrary call);
 ///      - Morpho gets an exact allowance for the repayment; the PoolManager is paid exactly what we
 ///        took;
 ///      - the whole tx reverts unless the loan-token balance left after repayment is at least
@@ -105,7 +108,10 @@ contract AeroMigrationArb {
     address public executor;
     bool public paused;
     address public pendingOwner;
+    /// @notice Routers kind-0 steps may call.
     mapping(address => bool) public allowedTarget;
+    /// @notice Pool factories whose pools kind 1-3 steps may swap on.
+    mapping(address => bool) public allowedFactory;
 
     /// @dev Which funder may call back right now (FUND_*); 0 = none / already called back.
     uint256 private transient fundingInFlight;
@@ -134,6 +140,7 @@ contract AeroMigrationArb {
     event OwnerSet(address owner);
     event PausedSet(bool paused);
     event TargetAllowed(address indexed target, bool allowed);
+    event FactoryAllowed(address indexed factory, bool allowed);
     event Arb(address indexed loanToken, uint256 loanAmount, uint256 migrated, uint256 profit);
 
     modifier onlyOwner() {
@@ -291,7 +298,7 @@ contract AeroMigrationArb {
     function _poolSwap(ArbStep memory s, uint256 amount) private {
         ISolidlyPool pool = ISolidlyPool(s.target);
         address f = pool.factory();
-        if (!allowedTarget[f] || !ISolidlyFactory(f).isPool(s.target)) revert TargetNotAllowed(s.target);
+        if (!allowedFactory[f] || !ISolidlyFactory(f).isPool(s.target)) revert TargetNotAllowed(s.target);
         uint256 out = s.kind == 1 ? pool.getAmountOut(amount, s.tokenIn) : pool.getAmountOutWithTotalFee(amount, s.tokenIn);
         // 1 ppm below the quote: guards against fee rounding between the view and swap().
         out -= out / 1_000_000 + 1;
@@ -307,7 +314,7 @@ contract AeroMigrationArb {
         address f = IClPool(s.target).factory();
         address t0 = pool.token0();
         address t1 = pool.token1();
-        if (!allowedTarget[f] || IClFactory(f).getPool(t0, t1, IClPool(s.target).tickSpacing()) != s.target) {
+        if (!allowedFactory[f] || IClFactory(f).getPool(t0, t1, IClPool(s.target).tickSpacing()) != s.target) {
             revert TargetNotAllowed(s.target);
         }
         bool zeroForOne = s.tokenIn == t0;
@@ -341,7 +348,14 @@ contract AeroMigrationArb {
         emit TargetAllowed(target, allowed);
     }
 
-    /// @notice Executor may pause (bot self-stop); only owner may resume.
+    function setAllowedFactory(address factory, bool allowed) external onlyOwner {
+        allowedFactory[factory] = allowed;
+        emit FactoryAllowed(factory, allowed);
+    }
+
+    /// @notice The executor (hot wallet) or the owner may pause, e.g. an operator stop with the hot
+    ///         key at hand (the bot itself never calls it; its kill switch is a file); only owner may
+    ///         resume.
     function pause() external {
         if (msg.sender != owner && msg.sender != executor) revert Unauthorized();
         paused = true;

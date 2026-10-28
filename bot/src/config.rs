@@ -73,7 +73,8 @@ pub struct AeroConfig {
     /// new_factories, so factories Aero adds after launch are picked up without a restart.
     #[serde(default)]
     pub factory_registry: Option<Address>,
-    /// Flash-loan tokens; profit is counted in them, so only USD stablecoins.
+    /// Flash-loan tokens; profit is counted in them. A USD stablecoin, or a token with `usd_pool`
+    /// (its USD price is read from that pool each pass).
     #[serde(default)]
     pub loan_tokens: Vec<AeroLoan>,
     #[serde(default = "default_aero_min_profit")]
@@ -94,15 +95,13 @@ pub struct AeroConfig {
     /// On-chain minProfit = exact simulated profit x this.
     #[serde(default = "default_aero_keep")]
     pub min_profit_keep: f64,
-    /// Reverts are normal here (someone took the spread first, deadline passed): no permanent halt.
-    /// When max_failures_in_window failed / dropped txs fall within failure_window_secs, sending
-    /// pauses for failure_cooldown_secs, then resumes by itself.
-    #[serde(default = "default_aero_max_fail")]
-    pub max_failures_in_window: u32,
-    #[serde(default = "default_aero_fail_window")]
-    pub failure_window_secs: u64,
-    #[serde(default = "default_aero_fail_window")]
-    pub failure_cooldown_secs: u64,
+    /// The arb tx is valid this long; converted to blocks with the observed block time (2 s
+    /// blocks: 2; 200 ms blocks: 20), so a block-time change needs no config edit.
+    #[serde(default = "default_aero_deadline")]
+    pub deadline_secs: f64,
+    /// A `usd_feed` answer older than this is not used (the pool, or the last price, is).
+    #[serde(default = "default_usd_feed_age")]
+    pub usd_feed_max_age_secs: u64,
     /// Gas model for the profit check: base + per swap leg (measured 2026-10-22: 2 legs ~0.73-0.86M,
     /// 4 legs ~1.1M).
     #[serde(default = "default_aero_gas_base")]
@@ -142,9 +141,21 @@ pub struct AeroConfig {
 pub struct AeroLoan {
     pub token: Address,
     pub decimals: u8,
-    /// Legacy Solidly pool token/USDC that prices a non-USD loan token (e.g. WETH); unset = 1 USD.
+    /// Chainlink USD feed (8 decimals, `latestAnswer`) that prices a non-USD loan token (e.g.
+    /// ETH/USD for WETH). Preferred over `usd_pool`: a pool can drain or be pushed.
+    #[serde(default)]
+    pub usd_feed: Option<Address>,
+    /// Solidly pool token/USDC (`getAmountOut`) that prices it when there is no feed. Neither set
+    /// = 1 USD.
     #[serde(default)]
     pub usd_pool: Option<Address>,
+}
+
+impl AeroLoan {
+    /// Priced in USD by a feed or a pool (not a USD stablecoin itself).
+    pub fn is_priced(&self) -> bool {
+        self.usd_feed.is_some() || self.usd_pool.is_some()
+    }
 }
 
 /// `[aero] funding`.
@@ -274,6 +285,24 @@ pub struct ExecConfig {
     /// state dir (see `nonce_path`), so bots in different repos/directories still share it.
     #[serde(default)]
     pub nonce_file: String,
+    /// "live" is required in the config as well as `--live` on the command line before anything is
+    /// sent (two switches, so neither a stray flag nor a copied config sends alone).
+    #[serde(default = "default_exec_mode")]
+    pub mode: String,
+    /// Gas burned by failed (reverted) txs per UTC day, in USD; once reached nothing is sent until
+    /// the next day. Successful sends paid for themselves and are not charged.
+    #[serde(default = "default_daily_gas_budget")]
+    pub daily_gas_budget_usd: f64,
+    /// Reverts are normal for arbs (someone took the spread first, deadline passed): no permanent
+    /// halt. When max_failures_in_window failed / dropped txs fall within failure_window_secs,
+    /// sending pauses for failure_cooldown_secs, then resumes by itself. Enforced by the executor
+    /// for every strategy.
+    #[serde(default = "default_aero_max_fail")]
+    pub max_failures_in_window: u32,
+    #[serde(default = "default_aero_fail_window")]
+    pub failure_window_secs: u64,
+    #[serde(default = "default_aero_fail_window")]
+    pub failure_cooldown_secs: u64,
 }
 
 impl ExecConfig {
@@ -325,6 +354,29 @@ pub struct RpcEntry {
 fn default_pw_env() -> String {
     "BOT_KEYSTORE_PASSWORD".into()
 }
+/// A relative path from the config, anchored at the config file's directory: the same file whatever
+/// directory the bot is started from (a kill switch that silently points elsewhere does not stop it).
+fn anchored(config_path: &str, p: &str) -> String {
+    let path = std::path::Path::new(p);
+    if p.is_empty() || path.is_absolute() {
+        return p.to_string();
+    }
+    let dir = std::path::Path::new(config_path).parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+    dir.join(path).to_string_lossy().into_owned()
+}
+
+fn default_exec_mode() -> String {
+    "shadow".into()
+}
+fn default_daily_gas_budget() -> f64 {
+    5.0
+}
+fn default_usd_feed_age() -> u64 {
+    3600
+}
+fn default_aero_deadline() -> f64 {
+    4.0
+}
 fn default_kill_file() -> String {
     "data/KILL".into()
 }
@@ -339,7 +391,9 @@ pub struct ResolvedRpc {
 impl Config {
     pub fn load(path: &str) -> Result<Self> {
         let text = std::fs::read_to_string(path).with_context(|| format!("reading {path}"))?;
-        toml::from_str(&text).with_context(|| format!("parsing {path}"))
+        let mut cfg: Self = toml::from_str(&text).with_context(|| format!("parsing {path}"))?;
+        cfg.exec.kill_switch_file = anchored(path, &cfg.exec.kill_switch_file);
+        Ok(cfg)
     }
 
     pub fn resolve_rpc(&self) -> Result<ResolvedRpc> {
@@ -442,6 +496,14 @@ mod tests {
         assert_eq!(parse("funding = \"v4\"").funding, AeroFunding::V4);
         assert_eq!(parse("funding = \"auto\"").funding, AeroFunding::Auto);
         assert!(toml::from_str::<Config>(&format!("{MINIMAL}\n[aero]\nfunding = \"balancer\"")).is_err(), "typos are rejected");
+    }
+
+    #[test]
+    fn relative_kill_switch_paths_follow_the_config_file() {
+        assert_eq!(anchored("/srv/bot/config.local.toml", "data/KILL"), "/srv/bot/data/KILL");
+        assert_eq!(anchored("config.toml", "data/KILL"), "./data/KILL");
+        assert_eq!(anchored("/srv/bot/config.toml", "/var/KILL"), "/var/KILL", "absolute stays");
+        assert_eq!(anchored("/srv/bot/config.toml", ""), "", "unset stays unset");
     }
 
     #[test]

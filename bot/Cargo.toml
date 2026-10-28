@@ -7,7 +7,7 @@ license = "AGPL-3.0-or-later"
 publish = false
 
 [dependencies]
-alloy = { version = "2.5.0", features = ["full", "json-rpc", "signer-local", "signer-keystore"] }
+alloy = { version = "2.5.0", features = ["full", "json-rpc", "signer-local", "signer-keystore", "node-bindings"] }
 anyhow = "1.0.104"
 brotli = "8"
 clap = { version = "4.6.7", features = ["derive"] }

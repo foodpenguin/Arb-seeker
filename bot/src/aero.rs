@@ -49,9 +49,10 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::{
+    arb_exec::{ArbExecutor, BidPolicy, Candidate},
     config::{AeroConfig, AeroFunding, Config},
     chain::multicall,
-    executor::{Executor, Inflight, MinProfitSlot, Outcome, Payload, SendRequest},
+    executor::{Executor, Inflight, MinProfitSlot, Outcome},
     flash::{self, FlashAccounting, FlashLoan, MorphoBlue, UniswapV4},
     flashblocks::Flashblock,
     heads::{self, Head},
@@ -71,8 +72,10 @@ sol! {
         function MORPHO() external view returns (address);
         function POOL_MANAGER() external view returns (address);
         function executor() external view returns (address);
+        function PROFIT_RECEIVER() external view returns (address);
         function paused() external view returns (bool);
         function allowedTarget(address) external view returns (bool);
+        function allowedFactory(address) external view returns (bool);
         function MIGRATION() external view returns (address);
         function NEW_TOKEN() external view returns (address);
     }
@@ -88,6 +91,7 @@ sol! {
         function getAmountOut(uint256 amountIn, address tokenIn) external view returns (uint256);
         function getAmountOutWithTotalFee(uint256 amountIn, address tokenIn) external view returns (uint256);
     }
+    interface IUsdFeed { function latestRoundData() external view returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound); }
     interface IPoolState {
         function getReserves() external view returns (uint256, uint256, uint256);
         function liquidity() external view returns (uint128);
@@ -428,16 +432,9 @@ fn arb_gas(a: &AeroConfig, legs: usize, f: &Funder) -> u64 {
     (a.gas_base + a.gas_per_leg * legs as u64).saturating_sub(f.gas_saving())
 }
 
-/// Priority fee for an arb with this exact profit and net (USD) against its floor: the base bid, plus
-/// up to bid_share of the profit for a big one (profit >= bid_min_profit_usd), never past what the
-/// floor leaves (net - floor) nor bid_max_priority_wei. `gas` is the gas the tx is expected to use.
-fn bid_priority(a: &AeroConfig, profit_usd: f64, net_usd: f64, floor_usd: f64, gas: u64, eth_usd: f64) -> u128 {
-    if profit_usd < a.bid_min_profit_usd || a.bid_share <= 0.0 || gas == 0 || eth_usd <= 0.0 {
-        return a.priority_fee_wei;
-    }
-    let budget_usd = (profit_usd * a.bid_share).min(net_usd - floor_usd).max(0.0);
-    let extra = budget_usd / eth_usd * 1e18 / gas as f64;
-    (a.priority_fee_wei + extra as u128).min(a.bid_max_priority_wei.max(a.priority_fee_wei))
+/// Priority-fee bidding (see arb_exec::BidPolicy) from `[aero]`.
+fn bid_policy(a: &AeroConfig) -> BidPolicy {
+    BidPolicy { base_priority_wei: a.priority_fee_wei, min_profit_usd: a.bid_min_profit_usd, share: a.bid_share, max_priority_wei: a.bid_max_priority_wei }
 }
 
 /// Step kinds of AeroMigrationArb.
@@ -486,6 +483,23 @@ struct TickState {
     /// Passes quoted on the in-progress block (head + 1 or later) / all passes (aero_tick fresh_share).
     pending_hits: u64,
     quotes: u64,
+    /// Gas burned by reverted arbs today (exec.daily_gas_budget_usd).
+    budget: crate::arb_exec::DailyBudget,
+    /// (block, timestamp) the block time is measured from.
+    bt_anchor: Option<(u64, u64)>,
+}
+
+impl TickState {
+    /// Seconds per block, measured over at least 10 blocks since the first head (2 s until then).
+    fn block_time(&mut self, head: &Head) -> f64 {
+        let (n0, t0) = *self.bt_anchor.get_or_insert((head.number, head.timestamp));
+        if head.number >= n0 + 10 && head.timestamp > t0 { (head.timestamp - t0) as f64 / (head.number - n0) as f64 } else { 2.0 }
+    }
+
+    /// ETH/USD from the latest pass (the first priced loan token), or the fallback.
+    fn eth_usd(&self, a: &AeroConfig, fallback: f64) -> f64 {
+        a.loan_tokens.iter().zip(&self.usd).find(|(l, _)| l.is_priced()).map_or(fallback, |(_, u)| *u)
+    }
 }
 
 /// Aero merger arbitrage as an `OpportunitySource`: the state the per-block and same-block passes
@@ -503,6 +517,19 @@ pub struct Aero<'a> {
     watch: Watch,
     /// Same-block mode (the flashblocks stream is wired in).
     same_block: bool,
+    /// The contract keeps pool factories in their own list (`allowedFactory`); false = a deployment
+    /// from before the split, where factories are in `allowedTarget`.
+    factory_list: bool,
+}
+
+/// Does the contract have the separate factory allowlist? (A call to a missing function reverts.)
+async fn has_factory_list<P: Provider>(p: &P, c: Address) -> bool {
+    IAeroArb::new(c, p).allowedFactory(Address::ZERO).call().await.is_ok()
+}
+
+/// The call that tells whether the contract may swap on `factory`'s pools.
+fn factory_allowed_call(factory: Address, factory_list: bool) -> Bytes {
+    if factory_list { IAeroArb::allowedFactoryCall(factory).abi_encode().into() } else { IAeroArb::allowedTargetCall(factory).abi_encode().into() }
 }
 
 impl<'a> Aero<'a> {
@@ -514,10 +541,15 @@ impl<'a> Aero<'a> {
         if exec.is_some() && a.contract.is_none() {
             bail!("--live needs [aero] contract");
         }
+        let mut factory_list = true;
         if let Some(c) = a.contract {
             retry("funding check", || check_funding(p, a, c)).await?;
+            factory_list = has_factory_list(p, c).await;
+            if !factory_list {
+                info!(contract = %c, "aero: contract predates the separate factory allowlist; reading factories from allowedTarget");
+            }
             if let Some(e) = exec {
-                retry("pre-flight", || preflight(p, a, c, e.address)).await?;
+                retry("pre-flight", || preflight(p, a, c, e.address, factory_list)).await?;
             }
         }
         log_funding(p, a).await;
@@ -528,11 +560,13 @@ impl<'a> Aero<'a> {
         info!(live = exec.is_some(), contract = ?a.contract, same_block, "aero: start");
         writeln!(journal, "{}", json!({ "kind": "aero_start", "live": exec.is_some(), "contract": a.contract, "same_block": same_block }))?;
         let state = TickState {
-            usd: a.loan_tokens.iter().map(|l| if l.usd_pool.is_some() { cfg.exec.eth_usd_fallback.max(1.0) } else { 1.0 }).collect(),
+            usd: a.loan_tokens.iter().map(|l| if l.is_priced() { cfg.exec.eth_usd_fallback.max(1.0) } else { 1.0 }).collect(),
             logged: HashMap::new(),
             quoter,
             pending_hits: 0,
             quotes: 0,
+            budget: Default::default(),
+            bt_anchor: None,
         };
         let sb = SameBlock::default();
         let watch = watch_for(a, &[], &sb);
@@ -547,6 +581,7 @@ impl<'a> Aero<'a> {
             sb,
             watch,
             same_block,
+            factory_list,
         })
     }
 }
@@ -560,7 +595,7 @@ impl<P: Provider + Clone> OpportunitySource<P> for Aero<'_> {
         let a = &self.cfg.aero;
         let block = head.number;
         if self.last_discovery == 0 || block >= self.last_discovery + DISCOVERY_EVERY {
-            match discover(p, a, &mut self.token0s).await {
+            match discover(p, a, &mut self.token0s, self.factory_list).await {
                 Ok(found) => {
                     self.last_discovery = block;
                     for path in &found {
@@ -590,7 +625,7 @@ impl<P: Provider + Clone> OpportunitySource<P> for Aero<'_> {
             writeln!(self.journal, "{}", json!({ "kind": "aero_same_block", "block": block, "stats": s, "learned": self.sb.learned.len() }))?;
         }
         let cooling = exec.as_ref().is_some_and(|e| e.halted());
-        if let Err(err) = tick(self.cfg, p, head, &self.new_ladder, &self.paths, exec, cooling, &mut self.state, &mut self.journal, &At::Sealed(BlockId::latest()), &mut None).await {
+        if let Err(err) = tick(self.cfg, p, head, &self.new_ladder, &self.paths, exec, cooling, &mut self.state, &mut self.journal, &At::Sealed(BlockId::number(head.number)), &mut None).await {
             warn!(error = %err, block, "aero: tick failed");
         }
         Ok(())
@@ -606,7 +641,14 @@ impl<P: Provider + Clone> OpportunitySource<P> for Aero<'_> {
 
     fn on_outcome(&mut self, block: u64, inf: &Inflight, outcome: &Outcome, gas_spent_total_wei: U256, cooldown_started: bool) -> Result<()> {
         if cooldown_started {
-            writeln!(self.journal, "{}", json!({ "kind": "aero_cooldown", "block": block, "secs": self.cfg.aero.failure_cooldown_secs }))?;
+            writeln!(self.journal, "{}", json!({ "kind": "aero_cooldown", "block": block, "secs": self.cfg.exec.failure_cooldown_secs }))?;
+        }
+        // A revert burned gas for nothing: it counts against the daily budget.
+        if let Outcome::Included { success: false, gas_used, effective_gas_price, l1_fee_wei, .. } = outcome {
+            let eth_usd = self.state.eth_usd(&self.cfg.aero, self.cfg.exec.eth_usd_fallback);
+            let usd = (*gas_used as f64 * *effective_gas_price as f64 + *l1_fee_wei as f64) / 1e18 * eth_usd;
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+            self.state.budget.charge(now, usd);
         }
         info!(tx = %inf.hash, ?outcome, "aero: outcome");
         writeln!(self.journal, "{}", json!({ "kind": "aero_outcome", "block": block, "tx": inf, "outcome": outcome, "gas_spent_total_eth": units(gas_spent_total_wei, 18) }))?;
@@ -805,13 +847,15 @@ fn decode_profit(out: &Bytes) -> Option<U256> {
 }
 
 /// The deployed contract must match the config and be ready (executor, not paused).
-async fn preflight<P: Provider>(p: &P, a: &AeroConfig, c: Address, signer: Address) -> Result<()> {
+async fn preflight<P: Provider>(p: &P, a: &AeroConfig, c: Address, signer: Address, factory_list: bool) -> Result<()> {
     let arb = IAeroArb::new(c, p);
     anyhow::ensure!(arb.executor().call().await? == signer, "aero contract executor is not the hot wallet");
+    anyhow::ensure!(arb.PROFIT_RECEIVER().call().await? != signer, "aero contract PROFIT_RECEIVER is the hot wallet: profits must go to a cold wallet");
     anyhow::ensure!(!arb.paused().call().await?, "aero contract is paused");
     anyhow::ensure!(arb.MIGRATION().call().await? == a.migration, "aero contract MIGRATION differs from config");
     anyhow::ensure!(arb.NEW_TOKEN().call().await? == a.new_token, "aero contract NEW_TOKEN differs from config");
-    anyhow::ensure!(arb.allowedTarget(a.legacy_factory).call().await?, "aero contract: legacy_factory not allowlisted (buy side)");
+    let legacy_ok = if factory_list { arb.allowedFactory(a.legacy_factory).call().await? } else { arb.allowedTarget(a.legacy_factory).call().await? };
+    anyhow::ensure!(legacy_ok, "aero contract: legacy_factory not allowlisted (buy side)");
     info!(contract = %c, funding = ?a.funding, "aero: pre-flight passed");
     Ok(())
 }
@@ -837,7 +881,7 @@ fn decode_addr(b: Option<&Bytes>) -> Option<Address> {
 
 /// Every pool on both sides: buy = old AERO on the legacy V2 factory and the legacy CL factories;
 /// sell = new AERO on the Aero factories (config + registry), V2 or CL.
-async fn discover<P: Provider>(p: &P, a: &AeroConfig, token0s: &mut HashMap<Address, Address>) -> Result<Vec<Path>> {
+async fn discover<P: Provider>(p: &P, a: &AeroConfig, token0s: &mut HashMap<Address, Address>, factory_list: bool) -> Result<Vec<Path>> {
     let mut sell_factories = a.new_factories.clone();
     if let Some(reg) = a.factory_registry {
         match IFactoryRegistry::new(reg, p).targetFactories().call().await {
@@ -923,8 +967,9 @@ async fn discover<P: Provider>(p: &P, a: &AeroConfig, token0s: &mut HashMap<Addr
     // Which ones the contract may use (its gate is the factory; one multicall).
     let allowed: Vec<bool> = match a.contract {
         Some(c) => {
-            let q: Vec<(Address, Bytes)> = kept.iter().map(|(_, _, v)| (c, IAeroArb::allowedTargetCall(v.factory).abi_encode().into())).collect();
-            multicall(p, &q, BlockId::latest()).await?.iter().map(|r| r.as_ref().and_then(|b| IAeroArb::allowedTargetCall::abi_decode_returns(b).ok()).unwrap_or(false)).collect()
+            // Both lists answer a bool, so one decoder serves either.
+            let q: Vec<(Address, Bytes)> = kept.iter().map(|(_, _, v)| (c, factory_allowed_call(v.factory, factory_list))).collect();
+            multicall(p, &q, BlockId::latest()).await?.iter().map(|r| r.as_ref().and_then(|b| IAeroArb::allowedFactoryCall::abi_decode_returns(b).ok()).unwrap_or(false)).collect()
         }
         None => vec![true; kept.len()],
     };
@@ -1064,11 +1109,18 @@ async fn quote<P: Provider>(cfg: &Config, p: &P, paths: &[Path], loans: &[Vec<U2
     let f = math::u256_f64;
     let mut calls: Vec<(Address, Bytes)> = vec![];
     let mut usd_idx = vec![];
+    // USD per loan token, read in the same multicall: a Chainlink feed (unless stale), else a pool
+    // quote. (feed call, pool call) indices; both None = a USD stablecoin.
     for l in &a.loan_tokens {
-        usd_idx.push(l.usd_pool.map(|up| {
+        let feed = l.usd_feed.map(|f| {
+            calls.push((f, IUsdFeed::latestRoundDataCall {}.abi_encode().into()));
+            calls.len() - 1
+        });
+        let pool = l.usd_pool.map(|up| {
             calls.push((up, ISolidlyPool::getAmountOutCall { amountIn: U256::from(10u64).pow(U256::from(l.decimals)), tokenIn: l.token }.abi_encode().into()));
             calls.len() - 1
-        }));
+        });
+        usd_idx.push((feed, pool));
     }
     let ladder = |path: &Path| -> Vec<U256> { if path.buy { loans[path.loan].clone() } else { new_ladder.to_vec() } };
     let token_in = |path: &Path| -> Address { if path.buy { a.loan_tokens[path.loan].token } else { a.new_token } };
@@ -1122,9 +1174,21 @@ async fn quote<P: Provider>(cfg: &Config, p: &P, paths: &[Path], loans: &[Vec<U2
         .collect();
     let usd: Vec<Option<f64>> = usd_idx
         .iter()
-        .map(|i| match i {
-            None => Some(1.0),
-            Some(i) => r[*i].as_ref().and_then(|b| ISolidlyPool::getAmountOutCall::abi_decode_returns(b).ok()).map(|v| units(v, 6)),
+        .enumerate()
+        .map(|(li, (feed, pool))| {
+            if feed.is_none() && pool.is_none() {
+                return Some(1.0);
+            }
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+            let from_feed = feed.and_then(|i| r[i].as_ref()).and_then(|b| IUsdFeed::latestRoundDataCall::abi_decode_returns(b).ok()).and_then(|d| {
+                let age = now.saturating_sub(d.updatedAt.saturating_to::<u64>());
+                if age > a.usd_feed_max_age_secs {
+                    warn!(loan = %a.loan_tokens[li].token, age_s = age, "aero: USD feed is stale; falling back to the pool / last price");
+                    return None;
+                }
+                d.answer.is_positive().then(|| units(d.answer.into_raw(), 8))
+            });
+            from_feed.or_else(|| pool.and_then(|i| r[i].as_ref()).and_then(|b| ISolidlyPool::getAmountOutCall::abi_decode_returns(b).ok()).map(|v| units(v, 6)))
         })
         .collect();
     let mut curves: Vec<Option<Curve>> = vec![None; paths.len()];
@@ -1186,7 +1250,8 @@ async fn tick<P: Provider + Clone>(
             (0..LOAN_STEPS).map(|k| U256::from((MIN_LOAN_USD * r.powi(k as i32) / usd * 10f64.powi(l.decimals as i32)) as u128)).collect()
         })
         .collect();
-    // The per-head pass quotes on "latest", right when the head arrives. Measured 2026-10-22: at
+    // The per-head pass quotes at the head itself (pinned by number, so every call of the pass and
+    // the exact check read the same state even across endpoints), right when it arrives. Measured: at
     // that moment neither base-preconf's "latest" nor any endpoint's "pending" is ahead of the
     // sealed head (the next block's flashblocks have not started), and base-preconf's "pending"
     // even lags a block, so asking both only doubled the load. What moves the pools before our
@@ -1221,9 +1286,8 @@ async fn tick<P: Provider + Clone>(
 
     // Gas in USD for a plan with `legs` swaps funded by `f` (the price of the WETH-like loan token,
     // if any).
-    let eth_usd = a.loan_tokens.iter().zip(&state.usd).find(|(l, _)| l.usd_pool.is_some()).map_or(cfg.exec.eth_usd_fallback, |(_, u)| *u);
-    let gas_price = head.base_fee + a.priority_fee_wei;
-    let gas_usd = |legs: usize, f: &Funder| arb_gas(a, legs, f) as f64 * gas_price as f64 / 1e18 * eth_usd;
+    let eth_usd = state.eth_usd(a, cfg.exec.eth_usd_fallback);
+    let gas_usd = |legs: usize, f: &Funder| crate::arb_exec::gas_cost_usd(arb_gas(a, legs, f), head.base_fee, a.priority_fee_wei, eth_usd);
 
     // Minimum net profit for a loan of `loan_usd`: the absolute floor, and min_profit_bps of the loan.
     let floor = |loan_usd: f64| a.min_profit_usd.max(loan_usd * a.min_profit_bps / 1e4);
@@ -1297,38 +1361,47 @@ async fn tick<P: Provider + Clone>(
         return Ok(());
     };
 
-    // ---- exact check: the contract itself, at the best size and its neighbours (re-split each),
-    // priced like the real tx: Aero's MEV tax and dynamic fees read tx.gasprice, which is 0 in a
-    // plain eth_call. The pending nonce is fetched at the same time (another bot, e.g. a liquidation
-    // bot, may sign with the same hot wallet and its sends are invisible to this process).
-    let deadline = block + 2;
-    let from = exec.as_ref().map_or(cfg.exec.executor, |e| e.address);
-    let max_fee = head.base_fee * 2 + a.priority_fee_wei;
+    // ---- exact check, bid and send (arb_exec.rs): the best size and its neighbours (re-split
+    // each), each through every enabled funding source (funding = "auto": both, in parallel), Morpho
+    // first so it keeps exact ties. Priced like the real tx: Aero's MEV tax and dynamic fees read
+    // tx.gasprice, which is 0 in a plain eth_call. The pending nonce is fetched at the same time
+    // (another bot may sign with the same hot wallet and its sends are invisible to this process).
+    let deadline = block + crate::arb_exec::deadline_blocks(a.deadline_secs, state.block_time(head));
+    let ae = ArbExecutor {
+        name: "aero",
+        contract,
+        from: exec.as_ref().map_or(cfg.exec.executor, |e| e.address),
+        gas_limit: a.gas_limit,
+        base_fee_wei: head.base_fee,
+        bid: bid_policy(a),
+        min_profit_slot: ARB_MIN_PROFIT,
+        min_profit_keep: a.min_profit_keep,
+        eth_usd,
+        decode: decode_profit,
+    };
     let (buys, sells) = (side_curves(paths, &curves, li, true), side_curves(paths, &curves, li, false));
-    let candidates: Vec<Plan> = [0.7, 1.0, 1.4].iter().filter_map(|k| plan(best_plan.loan * k, &buys, &sells)).collect();
-    // Every candidate size through every enabled funding source (funding = "auto": both, checked in
-    // parallel, so no extra latency), as (candidate, source, amount, calldata).
-    let built: Vec<(usize, &Funder, U256, Bytes)> = candidates
-        .iter()
-        .enumerate()
-        .flat_map(|(ci, pl)| {
-            let amt = U256::from(pl.loan as u128);
-            let (buy, sell) = steps(a, paths, l.token, pl);
-            funders.iter().map(move |f| (ci, f, amt, f.encode(l.token, amt, buy.clone(), sell.clone(), deadline)))
-        })
-        .collect();
+    let plans: Vec<Plan> = [0.7, 1.0, 1.4].iter().filter_map(|k| plan(best_plan.loan * k, &buys, &sells)).collect();
+    // (plan, source, amount) per candidate.
+    let mut built: Vec<(usize, &Funder, U256)> = vec![];
+    let mut cands: Vec<Candidate> = vec![];
+    for (pi, pl) in plans.iter().enumerate() {
+        let amt = U256::from(pl.loan as u128);
+        let (buy, sell) = steps(a, paths, l.token, pl);
+        for f in &funders {
+            built.push((pi, f, amt));
+            cands.push(Candidate {
+                calldata: f.encode(l.token, amt, buy.clone(), sell.clone(), deadline),
+                // Each source at its own gas: with equal profit (both 0 fee) V4 wins on its gas
+                // saving, Morpho wherever V4 cannot fund the size.
+                gas_est: arb_gas(a, pl.buy.len() + pl.sell.len(), f),
+                floor_usd: floor(pl.loan / dec * state.usd[li]),
+                l1_usd: 0.0,
+            });
+        }
+    }
+    let call = |tx: TransactionRequest| call_at(p, tx, exact_at);
     let may_send = !cooling && !std::path::Path::new(&cfg.exec.kill_switch_file).exists() && exec.as_ref().is_some_and(|e| !e.halted() && e.inflight.is_none());
     let mut exec = exec;
-    let exact_calls = futures::future::join_all(built.iter().map(|(_, _, _, cd)| {
-        let tx = TransactionRequest::default()
-            .from(from)
-            .to(contract)
-            .input(cd.clone().into())
-            .gas_limit(a.gas_limit)
-            .max_fee_per_gas(max_fee)
-            .max_priority_fee_per_gas(a.priority_fee_wei);
-        async move { call_at(p, tx, exact_at).await }
-    }));
     // The balance too: the node wants gas_limit x maxFee up front, which a bid raises.
     let nonce = async {
         match exec.as_mut() {
@@ -1336,46 +1409,36 @@ async fn tick<P: Provider + Clone>(
             _ => None,
         }
     };
-    let (exact, nonce) = tokio::join!(exact_calls, nonce);
-    let mut pick: Option<(usize, U256, f64, f64)> = None; // (built index, profit, gross usd, net usd)
-    for (i, res) in exact.iter().enumerate() {
-        if let Some(profit) = res.as_ref().ok().and_then(decode_profit) {
-            let c = &candidates[built[i].0];
-            let gross = units(profit, l.decimals) * state.usd[li];
-            // Each source at its own gas: with equal profit (both 0 fee) V4 wins on its ~21k gas
-            // saving, Morpho wherever V4 cannot fund the size.
-            let net = gross - gas_usd(c.buy.len() + c.sell.len(), built[i].1);
-            // Prefer sizes that clear the floor, then the higher net (strictly: an exact tie keeps
-            // the earlier entry, i.e. Morpho).
-            let ok = |n: f64, b: usize| n >= floor(candidates[built[b].0].loan / dec * state.usd[li]);
-            if pick.is_none_or(|(b0, _, _, n0)| (ok(net, i), net) > (ok(n0, b0), n0)) {
-                pick = Some((i, profit, gross, net));
-            }
-        }
+    // The L1 data fee (one read for the largest calldata) is paid whatever the priority: in the net.
+    let l1 = crate::arb_exec::l1_fee_wei(p, cands.iter().map(|c| c.calldata.len()).max().unwrap_or(0));
+    let (exact, nonce, l1) = tokio::join!(ae.exact(&cands, call), nonce, l1);
+    let l1_usd = l1.map_or(0.0, |w| math::u256_f64(w) / 1e18 * eth_usd);
+    for c in &mut cands {
+        c.l1_usd = l1_usd;
     }
+    let usd = |x: U256| units(x, l.decimals) * state.usd[li];
     // Each failure tagged with its funding source (with funding = "auto", which one broke matters).
     let errors: Vec<String> = exact
         .iter()
         .zip(&built)
-        .filter_map(|(r, (_, f, _, _))| r.as_ref().err().map(|e| format!("{}: {}", f.name(), e.to_string().chars().take(160).collect::<String>())))
+        .filter_map(|(r, (_, f, _))| r.as_ref().err().map(|e| format!("{}: {}", f.name(), e.to_string().chars().take(160).collect::<String>())))
         .collect();
-    let Some((i, profit, profit_usd, net_usd)) = pick else {
+    let Some(pk) = ae.pick(&cands, &exact, usd) else {
         writeln!(journal, "{}", json!({ "kind": "aero_opp", "block": block, "loan": best_plan.loan / dec, "route": route(&best_plan), "est_profit_usd": est, "exact_usd": null, "errors": errors, "state": state_label, "fb": at.fb() }))?;
         return Ok(());
     };
-    let (ci, source, amt, calldata) = (built[i].0, built[i].1, built[i].2, built[i].3.clone());
-    let funder = source.name();
-    let gas_cost = profit_usd - net_usd;
+    let (pi, source, amt) = built[pk.index];
+    let (c, funder) = (&cands[pk.index], source.name());
+    let (profit_usd, net_usd) = (pk.gross_usd, pk.net_usd);
     info!(block, loan = units(amt, l.decimals), profit_usd, net_usd, funding = funder, state = state_label, fb = %at.fb(), "aero: exact check");
-    writeln!(journal, "{}", json!({ "kind": "aero_opp", "block": block, "loan": units(amt, l.decimals), "route": route(&candidates[ci]), "est_profit_usd": est, "exact_usd": profit_usd, "gas_usd": gas_cost, "net_usd": net_usd, "funding": funder, "cooling": cooling, "state": state_label, "fb": at.fb(), "ahead": ahead }))?;
-    let need = floor(units(amt, l.decimals) * state.usd[li]);
-    if net_usd < need {
-        info!(block, net_usd, need, "aero: exact net below the floor; not sending");
+    writeln!(journal, "{}", json!({ "kind": "aero_opp", "block": block, "loan": units(amt, l.decimals), "route": route(&plans[pi]), "est_profit_usd": est, "exact_usd": profit_usd, "gas_usd": profit_usd - net_usd, "net_usd": net_usd, "funding": funder, "cooling": cooling, "state": state_label, "fb": at.fb(), "ahead": ahead }))?;
+    if net_usd < c.floor_usd {
+        info!(block, net_usd, need = c.floor_usd, "aero: exact net below the floor; not sending");
         return Ok(());
     }
 
-    // ---- send (live only; kill switch, cooldown, one tx in flight; no gas budget by choice, the
-    // running total is in aero_outcome)
+    // ---- send (live only; kill switch, cooldown, one tx in flight, daily gas budget for reverts;
+    // the running gas total is in aero_outcome)
     let Some(e) = exec else { return Ok(()) };
     let balance = match nonce {
         Some((Ok(_), Ok(b))) => math::u256_f64(b),
@@ -1389,59 +1452,14 @@ async fn tick<P: Provider + Clone>(
         }
         None => return Ok(()), // not allowed to send right now (see may_send)
     };
-    let legs = candidates[ci].buy.len() + candidates[ci].sell.len();
-    let gas_est = arb_gas(a, legs, source);
-    // The node wants gas_limit x maxFee (2 x base + priority) of balance up front: the highest
-    // priority a gas limit leaves room for, keeping 10% of the balance aside.
-    let room = |gas_limit: u64| ((balance * 0.9 / gas_limit as f64) as u128).saturating_sub(head.base_fee * 2);
-    let mut min_profit = U256::from((math::u256_f64(profit) * a.min_profit_keep) as u128);
-    let (mut priority, mut gas_limit) = (a.priority_fee_wei, a.gas_limit);
-    let bid = bid_priority(a, profit_usd, net_usd, need, gas_est, eth_usd);
-    if bid > a.priority_fee_wei {
-        // A bid goes with a tighter gas limit (2x the model; real use 0.6-1.2M), capped by the
-        // balance, and is checked again at its own priority: the MEV tax and dynamic fees read
-        // tx.gasprice. If it no longer clears the floor there, the base bid goes instead.
-        let gl = a.gas_limit.min(gas_est * 2);
-        let pr = bid.min(room(gl));
-        if pr > a.priority_fee_wei {
-            let tx = TransactionRequest::default()
-                .from(from)
-                .to(contract)
-                .input(calldata.clone().into())
-                .gas_limit(gl)
-                .max_fee_per_gas(head.base_fee * 2 + pr)
-                .max_priority_fee_per_gas(pr);
-            let at_bid = call_at(p, tx, exact_at).await.ok().and_then(|out| decode_profit(&out));
-            let bid_cost = (pr - a.priority_fee_wei) as f64 * gas_est as f64 / 1e18 * eth_usd;
-            match at_bid.map(|p2| (p2, units(p2, l.decimals) * state.usd[li] - gas_cost - bid_cost)) {
-                Some((p2, net2)) if net2 >= need => {
-                    (priority, gas_limit) = (pr, gl);
-                    min_profit = U256::from((math::u256_f64(p2) * a.min_profit_keep) as u128);
-                }
-                other => info!(block, bid_gwei = pr as f64 / 1e9, net_at_bid = ?other.map(|x| x.1), need, "aero: the bid does not pay at its own priority; base bid"),
-            }
-        }
-    }
-    if room(gas_limit) < priority {
-        warn!(balance_eth = balance / 1e18, gas_limit, "aero: hot wallet cannot cover worst-case gas; not sending");
-        return Ok(());
-    }
-    let bid_usd = (priority - a.priority_fee_wei) as f64 * gas_est as f64 / 1e18 * eth_usd;
-    let req = SendRequest {
-        payload: Payload { to: contract, calldata, min_profit: ARB_MIN_PROFIT },
-        min_profit,
-        gas_limit,
-        base_fee_wei: head.base_fee,
-        priority_fee_wei: priority,
-        market: usize::MAX,
-        user: contract,
-        block,
-        deadline_block: deadline,
-    };
-    match e.send(req).await {
-        Ok(inf) => {
-            warn!(tx = %inf.hash, profit_usd, net_usd, priority_gwei = priority as f64 / 1e9, bid_usd, state = state_label, fb = %at.fb(), "aero: SENT");
-            writeln!(journal, "{}", json!({ "kind": "aero_sent", "block": block, "tx": inf, "loan": units(amt, l.decimals), "route": route(&candidates[ci]), "exact_usd": profit_usd, "net_usd": net_usd, "funding": funder, "priority_fee_wei": priority, "bid_usd": bid_usd, "state": state_label, "fb": at.fb() }))?;
+    let Some(t) = ae.terms(c, &pk, balance, usd, call).await else { return Ok(()) };
+    // Daily gas budget: what this tx burns if it reverts (L2 gas at its priority + L1 fee).
+    let gates = crate::arb_exec::Gates { kill_switch_file: &cfg.exec.kill_switch_file, budget: &mut state.budget, daily_cap_usd: cfg.exec.daily_gas_budget_usd, now_unix: head.timestamp };
+    match ae.send(e, c, &t, gates, block, deadline).await {
+        Ok(None) => {}
+        Ok(Some(inf)) => {
+            warn!(tx = %inf.hash, profit_usd, net_usd, priority_gwei = t.priority_fee_wei as f64 / 1e9, bid_usd = t.bid_usd, state = state_label, fb = %at.fb(), "aero: SENT");
+            writeln!(journal, "{}", json!({ "kind": "aero_sent", "block": block, "tx": inf, "loan": units(amt, l.decimals), "route": route(&plans[pi]), "exact_usd": profit_usd, "net_usd": net_usd, "funding": funder, "priority_fee_wei": t.priority_fee_wei, "bid_usd": t.bid_usd, "state": state_label, "fb": at.fb() }))?;
         }
         Err(err) => warn!(error = %err, "aero: send failed"),
     }
@@ -1557,19 +1575,10 @@ mod tests {
     const POOL: Address = Address::repeat_byte(0x42);
 
     #[test]
-    fn big_arbs_bid_part_of_the_profit_small_ones_do_not() {
-        let a = AeroConfig { priority_fee_wei: 10_000_000, bid_min_profit_usd: 2.0, bid_share: 0.25, bid_max_priority_wei: 1_000_000_000, ..Default::default() };
-        let (gas, eth) = (1_000_000u64, 2400.0);
-        assert_eq!(bid_priority(&a, 1.5, 1.4, 0.3, gas, eth), 10_000_000, "below bid_min_profit_usd: base bid");
-        // $2.78 profit: 25% = $0.695 over 1M gas at $2400 = 0.2896 gwei on top of the base.
-        let p = bid_priority(&a, 2.78, 2.7, 2.0, gas, eth);
-        assert!((p as f64 - (10_000_000.0 + 0.695 / 2400.0 * 1e18 / 1e6)).abs() < 1e3, "{p}");
-        // The floor caps it: only net - floor = $0.2 may go to the bid.
-        let p = bid_priority(&a, 2.78, 2.2, 2.0, gas, eth);
-        assert!((p as f64 - (10_000_000.0 + 0.2 / 2400.0 * 1e18 / 1e6)).abs() < 1e3, "{p}");
-        // And so does the cap.
-        assert_eq!(bid_priority(&a, 100.0, 99.0, 1.0, gas, eth), 1_000_000_000);
-        assert_eq!(bid_priority(&AeroConfig { bid_share: 0.0, ..a.clone() }, 100.0, 99.0, 1.0, gas, eth), 10_000_000, "bidding off");
+    fn bid_policy_comes_from_the_aero_config() {
+        let a = AeroConfig { priority_fee_wei: 7, bid_min_profit_usd: 2.0, bid_share: 0.25, bid_max_priority_wei: 9, ..Default::default() };
+        let b = bid_policy(&a);
+        assert_eq!((b.base_priority_wei, b.min_profit_usd, b.share, b.max_priority_wei), (7, 2.0, 0.25, 9));
     }
 
     #[test]
@@ -1676,5 +1685,149 @@ mod tests {
         assert!(sb.pending.as_ref().unwrap().broken, "index 2 never came");
         sb.absorb(fb(102, 0, vec![]), &w);
         assert!(!sb.pending.as_ref().unwrap().broken && sb.pending.as_ref().unwrap().fresh.is_empty(), "the next block starts clean");
+    }
+}
+
+#[cfg(test)]
+mod e2e {
+    //! The send path end to end on a LOCAL anvil fork of Base (never mainnet): AeroMigrationArb
+    //! deployed and set up like the owner would, an arb through the real legacy pool and the real
+    //! Migration (the new-AERO sale is a fixed-rate stand-in router from the Foundry tests), checked
+    //! exactly, picked, priced and sent by ArbExecutor through the Executor, for both funding sources.
+    //!
+    //! Run: cargo test e2e -- --ignored --nocapture   (needs `anvil` on PATH and `forge build` in
+    //! contracts/; BASE_FORK_URL optional)
+    use alloy::{
+        network::{EthereumWallet, TransactionBuilder},
+        node_bindings::Anvil,
+        providers::{ProviderBuilder, ext::AnvilApi},
+        signers::local::PrivateKeySigner,
+    };
+
+    use super::*;
+    use crate::{
+        arb_exec::{ArbExecutor, BidPolicy, Candidate, DailyBudget, Gates},
+        executor::{Broadcaster, FailurePolicy},
+    };
+
+    sol! {
+        interface IArbAdmin {
+            function setAllowedTarget(address target, bool allowed) external;
+            function setAllowedFactory(address factory, bool allowed) external;
+        }
+        interface IFixedRateRouter { function swap(uint256 amountIn, address to) external returns (uint256); }
+        interface IErc20E { function balanceOf(address) external view returns (uint256); function transfer(address to, uint256 amount) external returns (bool); }
+    }
+    const MORPHO: Address = address!("BBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb");
+    const POOL_MANAGER: Address = address!("498581fF718922c3f8e6A244956aF099B2652b2b");
+    const USDC: Address = address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
+
+    fn deploy_code(artifact: &str, args: &[u8]) -> Bytes {
+        let a: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(artifact).unwrap_or_else(|_| panic!("{artifact}: run `forge build` in contracts/"))).unwrap();
+        let mut code = a["bytecode"]["object"].as_str().unwrap().parse::<Bytes>().unwrap().to_vec();
+        code.extend_from_slice(args);
+        code.into()
+    }
+
+    #[tokio::test]
+    #[ignore = "needs anvil + network; run with --ignored"]
+    async fn e2e_arb_executor_sends_a_profitable_arb_on_anvil_fork() {
+        let cfg = Config::load("config.example.toml").unwrap();
+        let a = &cfg.aero;
+        let fork = std::env::var("BASE_FORK_URL").unwrap_or_else(|_| "https://base.gateway.tenderly.co".into());
+        let anvil = Anvil::new().fork(fork).chain_id(8453).spawn();
+        let url = anvil.endpoint_url();
+        let owner: PrivateKeySigner = anvil.keys()[0].clone().into();
+        let hot: PrivateKeySigner = anvil.keys()[1].clone().into();
+        let receiver = anvil.addresses()[2];
+        let p = ProviderBuilder::new().connect_http(url.clone());
+        let owner_p = ProviderBuilder::new().wallet(EthereumWallet::from(owner.clone())).connect_http(url.clone());
+
+        // 1. Deploy as the owner would, allowlist the legacy V2 factory (pool steps) and the stand-in
+        //    router (router step). The router pays 0.95 USDC per new AERO: above old AERO's price.
+        let word = |x: Address| B256::left_padding_from(x.as_slice()).0;
+        let args: Vec<u8> = [MORPHO, POOL_MANAGER, a.migration, a.old_token, a.new_token, owner.address(), hot.address(), receiver].iter().flat_map(|x| word(*x)).collect();
+        let rc = owner_p.send_transaction(TransactionRequest::default().with_deploy_code(deploy_code("../contracts/out/AeroMigrationArb.sol/AeroMigrationArb.json", &args))).await.unwrap().get_receipt().await.unwrap();
+        let arb = rc.contract_address.expect("deployed");
+        let mut rargs = [word(a.new_token), word(USDC)].concat();
+        rargs.extend_from_slice(&U256::from(950_000u64).to_be_bytes::<32>());
+        let rc = owner_p.send_transaction(TransactionRequest::default().with_deploy_code(deploy_code("../contracts/out/AeroMigrationArb.fork.t.sol/FixedRateRouter.json", &rargs))).await.unwrap().get_receipt().await.unwrap();
+        let router = rc.contract_address.expect("router deployed");
+        for data in [IArbAdmin::setAllowedFactoryCall { factory: a.legacy_factory, allowed: true }.abi_encode(), IArbAdmin::setAllowedTargetCall { target: router, allowed: true }.abi_encode()] {
+            assert!(owner_p.send_transaction(TransactionRequest::default().with_to(arb).with_input(data)).await.unwrap().get_receipt().await.unwrap().status());
+        }
+        // Fund the stand-in router with USDC (from Morpho's balance, impersonated on the fork).
+        p.anvil_impersonate_account(MORPHO).await.unwrap();
+        p.anvil_set_balance(MORPHO, U256::from(10u64).pow(U256::from(18))).await.unwrap();
+        let fund = IErc20E::transferCall { to: router, amount: U256::from(1_000_000_000_000u64) }.abi_encode();
+        assert!(p.send_transaction(TransactionRequest::default().with_from(MORPHO).with_to(USDC).with_input(fund)).await.unwrap().get_receipt().await.unwrap().status());
+
+        // 2. The candidates: 1000 USDC through each funding source (Morpho first).
+        let q = ILegacyFactory::getPoolCall { a: a.old_token, b: USDC, stable: false }.abi_encode();
+        let pool = Address::from_slice(&p.call(TransactionRequest::default().with_to(a.legacy_factory).with_input(q)).await.unwrap()[12..32]);
+        let loan = U256::from(1_000_000_000u64);
+        let buy = vec![ArbStep { kind: U256::from(KIND_LEGACY_V2), target: pool, tokenIn: USDC, amountIn: loan, patchOffset: U256::ZERO, data: Bytes::new() }];
+        let sell_data: Bytes = IFixedRateRouter::swapCall { amountIn: U256::ZERO, to: arb }.abi_encode().into();
+        let sell = vec![ArbStep { kind: U256::ZERO, target: router, tokenIn: a.new_token, amountIn: U256::MAX, patchOffset: U256::from(4u8), data: sell_data }];
+        let n = p.get_block_number().await.unwrap();
+        let base_fee = p.get_block_by_number(alloy::eips::BlockNumberOrTag::Latest).await.unwrap().unwrap().header.base_fee_per_gas.unwrap_or(0) as u128;
+        let funding = AeroConfig { funding: AeroFunding::Auto, pool_manager: Some(POOL_MANAGER), ..a.clone() };
+        let funders = Funder::enabled(&funding);
+        let cands: Vec<Candidate> = funders
+            .iter()
+            .map(|f| Candidate { calldata: f.encode(USDC, loan, buy.clone(), sell.clone(), n + 20), gas_est: arb_gas(a, 2, f), floor_usd: 1.0, l1_usd: 0.0 })
+            .collect();
+        let ae = ArbExecutor {
+            name: "aero-e2e",
+            contract: arb,
+            from: hot.address(),
+            gas_limit: a.gas_limit,
+            base_fee_wei: base_fee.max(1),
+            bid: BidPolicy { base_priority_wei: 1_000_000, min_profit_usd: 1e9, share: 0.0, max_priority_wei: 1_000_000 },
+            min_profit_slot: ARB_MIN_PROFIT,
+            min_profit_keep: 0.5,
+            eth_usd: 2400.0,
+            decode: decode_profit,
+        };
+        let call = |tx: TransactionRequest| {
+            let p = &p;
+            async move { Ok(p.call(tx).await?) }
+        };
+        let usd = |x: U256| units(x, 6);
+
+        // 3. Exact check both, pick, price, send through the gates, settle.
+        let exact = ae.exact(&cands, call).await;
+        assert!(exact.iter().all(|r| r.is_ok()), "both sources fund it: {exact:?}");
+        let pk = ae.pick(&cands, &exact, usd).expect("a profitable candidate");
+        assert_eq!(funders[pk.index].name(), "v4", "equal profit: the cheaper V4 entry wins");
+        let bcast = Broadcaster::new(reqwest::Client::new(), vec![("anvil".into(), url.to_string())]);
+        let policy = FailurePolicy { max_in_window: 3, window: std::time::Duration::from_secs(600), cooldown: std::time::Duration::from_secs(600) };
+        let mut ex = Executor::new(p.clone(), hot.clone(), 8453, bcast, policy);
+        let balance = math::u256_f64(ex.balance().await.unwrap());
+        let t = ae.terms(&cands[pk.index], &pk, balance, usd, call).await.expect("the wallet covers it");
+        let mut budget = DailyBudget::default();
+        let kill = std::env::temp_dir().join(format!("arb-e2e-no-kill-{}", std::process::id()));
+        let gates = Gates { kill_switch_file: kill.to_str().unwrap(), budget: &mut budget, daily_cap_usd: 5.0, now_unix: 0 };
+        let inf = ae.send(&mut ex, &cands[pk.index], &t, gates, n, n + 20).await.unwrap().expect("sent");
+        let mut outcome = None;
+        for _ in 0..30 {
+            if let Some((_, o)) = ex.poll(n + 1).await.unwrap() {
+                outcome = Some(o);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        let Some(Outcome::Included { success, gas_used, .. }) = outcome else { panic!("no outcome: {outcome:?}") };
+        assert!(success, "the arb reverted");
+        let q = IErc20E::balanceOfCall(receiver).abi_encode();
+        let got = U256::from_be_slice(&p.call(TransactionRequest::default().with_to(USDC).with_input(q)).await.unwrap()[..32]);
+        assert!(got > U256::ZERO, "profit reached the receiver");
+        println!("e2e arb: tx {} via {} gas {gas_used}, profit {} USDC (6dp)", inf.hash, funders[pk.index].name(), got);
+
+        // 4. The gates hold: a kill-switch file stops the next send before the executor sees it.
+        std::fs::write(&kill, b"stop").unwrap();
+        let gates = Gates { kill_switch_file: kill.to_str().unwrap(), budget: &mut budget, daily_cap_usd: 5.0, now_unix: 0 };
+        assert!(ae.send(&mut ex, &cands[pk.index], &t, gates, n, n + 20).await.unwrap().is_none(), "kill switch");
+        let _ = std::fs::remove_file(&kill);
     }
 }

@@ -1,11 +1,11 @@
 //! Arbitrage bot framework — entry point.
 //!
-//! Chain/protocol-agnostic plumbing (rpc, heads, executor, flashblocks, router/v3router, chain,
-//! num) plus arbitrage strategies. Aero merger arbitrage is the first strategy. New strategies
-//! will implement the trait seams described in README.md (OpportunitySource / ArbExecutor and the
-//! funding traits FlashLoan / FlashAccounting); aero is being migrated behind them.
+//! Chain/protocol-agnostic plumbing (rpc, heads, executor, flashblocks, chain, num), the strategy
+//! driver (runner: OpportunitySource), the send pipeline (arb_exec: ArbExecutor) and the funding
+//! traits (flash: FlashLoan / FlashAccounting). Aero merger arbitrage is the example strategy.
 
 mod aero;
+mod arb_exec;
 mod chain;
 mod config;
 mod executor;
@@ -45,6 +45,7 @@ fn main() -> Result<()> {
     // Live: load the key BEFORE the async runtime exists. The password may come from an env var that
     // is removed after reading, and mutating the environment is only sound while single-threaded.
     let live_signer = if cli.live {
+        anyhow::ensure!(cfg.exec.mode == "live", "--live needs exec.mode = \"live\" in the config too (it is {:?})", cfg.exec.mode);
         let ks = cfg.exec.keystore.clone().context("live mode needs exec.keystore")?;
         Some(executor::load_signer(&ks, &cfg.exec.keystore_password_env)?)
     } else {
@@ -94,8 +95,8 @@ async fn run(cfg: Config, live_signer: Option<alloy::signers::local::PrivateKeyS
         Some(signer) => {
             let b = executor::Broadcaster::new(executor::Broadcaster::client()?, broadcast);
             b.spawn_keepalive(executor::KEEPALIVE_EVERY);
-            let a = &cfg.aero;
-            let policy = executor::FailurePolicy { max_in_window: a.max_failures_in_window, window: Duration::from_secs(a.failure_window_secs), cooldown: Duration::from_secs(a.failure_cooldown_secs) };
+            let x = &cfg.exec;
+            let policy = executor::FailurePolicy { max_in_window: x.max_failures_in_window, window: Duration::from_secs(x.failure_window_secs), cooldown: Duration::from_secs(x.failure_cooldown_secs) };
             let nonce_file = cfg.exec.nonce_path(signer.address());
             info!(nonce_file = %nonce_file.display(), "shared hot-wallet nonce file");
             let mut e = executor::Executor::new(provider.clone(), signer, cfg.chain_id, b, policy).with_shared_nonce(nonce_file);

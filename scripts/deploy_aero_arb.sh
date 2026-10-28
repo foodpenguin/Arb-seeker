@@ -112,9 +112,16 @@ NONCE=$(cast nonce "$HOT" --block pending --rpc-url "$RPC")
 
 TODO=()
 [[ -z "$ARB" ]] && TODO+=("deploy AeroMigrationArb(morpho=$MORPHO, poolManager=$PM, owner=HOT, executor=HOT, profitReceiver=$COLD)")
+# Pool factories go in their own allowlist (allowedFactory). A deployment from before that split has
+# no allowedFactory(): it keeps factories in allowedTarget, so a resume uses that one.
+LIST=Factory
+if [[ -n "$ARB" && -z "$(rd "$ARB" 'allowedFactory(address)(bool)' 0x0000000000000000000000000000000000000000)" ]]; then
+  LIST=Target
+  echo "note: $ARB predates the separate factory allowlist; factories go in allowedTarget"
+fi
 TARGETS=()
 for f in "$LEGF" "${NEWF[@]}" "${LCL[@]}"; do
-  if [[ -z "$ARB" || "$(rd "$ARB" 'allowedTarget(address)(bool)' "$f")" != "true" ]]; then TARGETS+=("$f"); TODO+=("setAllowedTarget($f, true)"); fi
+  if [[ -z "$ARB" || "$(rd "$ARB" "allowed$LIST(address)(bool)" "$f")" != "true" ]]; then TARGETS+=("$f"); TODO+=("setAllowed$LIST($f, true)"); fi
 done
 [[ ${#TODO[@]} -gt 0 ]] || { echo "nothing to do: deployed and every factory allowlisted"; exit 0; }
 printf '\nAbout to send %d MAINNET transaction(s) from HOT %s:\n' "${#TODO[@]}" "$HOT"
@@ -139,9 +146,9 @@ if [[ -z "$ARB" ]]; then
 fi
 
 for f in "${TARGETS[@]}"; do
-  say "setAllowedTarget($f)"
-  send setAllowedTarget "$ARB" 'setAllowedTarget(address,bool)' "$f" true
-  wait_eq true "$ARB" 'allowedTarget(address)(bool)' "$f" || die "$f not allowlisted"
+  say "setAllowed$LIST($f)"
+  send "setAllowed$LIST" "$ARB" "setAllowed$LIST(address,bool)" "$f" true
+  wait_eq true "$ARB" "allowed$LIST(address)(bool)" "$f" || die "$f not allowlisted"
 done
 
 rm -f "$PWF"

@@ -123,7 +123,8 @@ contract AeroMigrationArbFork is Test {
 
     function setUp() public {
         string memory rpc = vm.envOr("BASE_RPC_URL", string("https://base.gateway.tenderly.co"));
-        uint256 forkBlock = vm.envOr("FORK_BLOCK", uint256(0));
+        // Pinned, so results do not drift with the chain (FORK_BLOCK overrides it; FORK_BLOCK=0 = latest).
+        uint256 forkBlock = vm.envOr("FORK_BLOCK", uint256(53206447));
         if (forkBlock == 0) vm.createSelectFork(rpc);
         else vm.createSelectFork(rpc, forkBlock);
         if (block.timestamp < LIQUID_OPEN) vm.warp(LIQUID_OPEN + 60);
@@ -143,7 +144,7 @@ contract AeroMigrationArbFork is Test {
             IMorphoFlash(MORPHO), IPoolManager(POOL_MANAGER), IAeroMigration(MIGRATION), OLD, NEW, owner, exec, receiver
         );
         vm.startPrank(owner);
-        arb.setAllowedTarget(V2_FACTORY, true);
+        arb.setAllowedFactory(V2_FACTORY, true);
         vm.stopPrank();
     }
 
@@ -198,8 +199,8 @@ contract AeroMigrationArbFork is Test {
         IERC20T(USDC).transfer(pool, 950_000e6);
         IPoolT(pool).mint(address(this));
         vm.startPrank(owner);
-        arb.setAllowedTarget(V2_FACTORY, true);
-        arb.setAllowedTarget(AERO_VOLATILE_FACTORY, true);
+        arb.setAllowedFactory(V2_FACTORY, true);
+        arb.setAllowedFactory(AERO_VOLATILE_FACTORY, true);
         vm.stopPrank();
         uint256 loan = 1_000e6;
         ArbStep memory b = ArbStep({kind: 1, target: LEGACY_AERO_USDC, tokenIn: USDC, amountIn: loan, patchOffset: 0, data: ""});
@@ -250,8 +251,8 @@ contract AeroMigrationArbFork is Test {
         address buyPool = IClFactoryT(legacyCl).getPool(OLD, USDC, 100);
         require(buyPool != address(0), "legacy AERO/USDC cl100 pool");
         vm.startPrank(owner);
-        arb.setAllowedTarget(legacyCl, true);
-        arb.setAllowedTarget(sellFactory, true);
+        arb.setAllowedFactory(legacyCl, true);
+        arb.setAllowedFactory(sellFactory, true);
         vm.stopPrank();
         uint256 loan = 1_000e6;
         ArbStep memory b = ArbStep({kind: 3, target: buyPool, tokenIn: USDC, amountIn: loan, patchOffset: 0, data: ""});
@@ -271,8 +272,8 @@ contract AeroMigrationArbFork is Test {
         address legacyCl = LEGACY_CL_FACTORIES[0];
         address buyCl = IClFactoryT(legacyCl).getPool(OLD, USDC, 100);
         vm.startPrank(owner);
-        arb.setAllowedTarget(legacyCl, true);
-        arb.setAllowedTarget(sellFactory, true);
+        arb.setAllowedFactory(legacyCl, true);
+        arb.setAllowedFactory(sellFactory, true);
         vm.stopPrank();
         ArbStep[] memory b = new ArbStep[](2);
         b[0] = ArbStep({kind: 3, target: buyCl, tokenIn: USDC, amountIn: 400e6, patchOffset: 0, data: ""});
@@ -295,8 +296,8 @@ contract AeroMigrationArbFork is Test {
         (address deep, address f2) = _freshClPool();
         assertTrue(tiny != deep);
         vm.startPrank(owner);
-        arb.setAllowedTarget(f1, true);
-        arb.setAllowedTarget(f2, true);
+        arb.setAllowedFactory(f1, true);
+        arb.setAllowedFactory(f2, true);
         vm.stopPrank();
         ArbStep[] memory s = new ArbStep[](2);
         s[0] = ArbStep({kind: 3, target: tiny, tokenIn: NEW, amountIn: 500e18, patchOffset: 0, data: ""});
@@ -317,7 +318,7 @@ contract AeroMigrationArbFork is Test {
     function test_fakeClPoolRejected() public {
         address legacyCl = LEGACY_CL_FACTORIES[0];
         vm.prank(owner);
-        arb.setAllowedTarget(legacyCl, true);
+        arb.setAllowedFactory(legacyCl, true);
         FakeClPool fake = new FakeClPool(legacyCl, OLD, USDC, 100);
         ArbStep memory b = ArbStep({kind: 3, target: address(fake), tokenIn: USDC, amountIn: 1_000e6, patchOffset: 0, data: ""});
         vm.prank(exec);
@@ -340,9 +341,27 @@ contract AeroMigrationArbFork is Test {
         if (owed1 > 0) IERC20T(USDC).transfer(msg.sender, owed1);
     }
 
+    /// A factory is a pool list, not a router: allowlisted as a factory it still cannot be a kind-0
+    /// target (an approve + arbitrary call), and a router target cannot vouch for pools.
+    function test_factoriesAndRoutersAreSeparateLists() public {
+        // V2_FACTORY is an allowed factory (setUp) but not a router target.
+        ArbStep memory asRouter = ArbStep({kind: 0, target: V2_FACTORY, tokenIn: USDC, amountIn: 1_000e6, patchOffset: 0, data: ""});
+        vm.prank(exec);
+        vm.expectRevert(); // TargetNotAllowed, wrapped by Morpho's callback revert
+        arb.arb(USDC, 1_000e6, _steps(asRouter), new ArbStep[](0), 0, block.number);
+        // A router target (not a factory) does not make a pool of its "factory" acceptable.
+        vm.startPrank(owner);
+        arb.setAllowedFactory(V2_FACTORY, false);
+        arb.setAllowedTarget(V2_FACTORY, true);
+        vm.stopPrank();
+        vm.prank(exec);
+        vm.expectRevert(); // TargetNotAllowed: the pool's factory is no allowed factory
+        arb.arb(USDC, 1_000e6, _steps(_buy(1_000e6)), new ArbStep[](0), 0, block.number);
+    }
+
     function test_fakePoolRejected() public {
         vm.prank(owner);
-        arb.setAllowedTarget(V2_FACTORY, true);
+        arb.setAllowedFactory(V2_FACTORY, true);
         FakePool fake = new FakePool(V2_FACTORY);
         ArbStep memory b = ArbStep({kind: 1, target: address(fake), tokenIn: USDC, amountIn: 1_000e6, patchOffset: 0, data: ""});
         vm.prank(exec);
@@ -441,8 +460,8 @@ contract AeroMigrationArbFork is Test {
         address legacyCl = LEGACY_CL_FACTORIES[0];
         address buyPool = IClFactoryT(legacyCl).getPool(OLD, USDC, 100);
         vm.startPrank(owner);
-        arb.setAllowedTarget(legacyCl, true);
-        arb.setAllowedTarget(sellFactory, true);
+        arb.setAllowedFactory(legacyCl, true);
+        arb.setAllowedFactory(sellFactory, true);
         vm.stopPrank();
         ArbStep memory b = ArbStep({kind: 3, target: buyPool, tokenIn: USDC, amountIn: 1_000e6, patchOffset: 0, data: ""});
         ArbStep memory sl = ArbStep({kind: 3, target: sellPool, tokenIn: NEW, amountIn: type(uint256).max, patchOffset: 0, data: ""});

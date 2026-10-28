@@ -26,12 +26,15 @@ priority = 2
 skip_methods = ["eth_simulateV1", "eth_getLogs"]
 
 [exec]
+mode = "shadow"                # "live" here AND `--live` on the command line are both needed to send
+daily_gas_budget_usd = 5.0     # gas burned by reverted arbs per UTC day; reached = nothing is sent until tomorrow
+max_failures_in_window = 5     # failed/dropped txs within failure_window_secs (600) -> pause failure_cooldown_secs (600), then resume
 executor = "0x000000000000000000000000000000000000dEaD"   # hot wallet ADDRESS only, never the key
 # keystore = "/home/<you>/.foundry/keystores/bot-hot"   # created with `cast wallet import bot-hot --interactive`
 # keystore_password_env = "BOT_KEYSTORE_PASSWORD"       # read once, then removed; else a prompt
 # extra_broadcast = ["https://mainnet-sequencer.base.org"]   # opt-in; never in a fork/test config
 eth_usd_fallback = 2400.0      # values gas and WETH-priced loans until an on-chain price is read
-# kill_switch_file = "data/KILL"   # if this file exists, nothing is sent
+# kill_switch_file = "data/KILL"   # if this file exists, nothing is sent (relative = next to this config file)
 # nonce_file = ""                  # default: ~/.local/state/onchain-bots/nonce-<wallet>, shared by every
 #                                  # bot signing with this wallet. Keep it empty: a relative path only
 #                                  # coordinates with bots started from the same directory.
@@ -71,12 +74,13 @@ new_factories = ["0x8E6a9FCd1d638CC760Ffba397605Fe3355dE76D2", "0x9CB220581b91b0
 factory_registry = "0x7b2A2c12dC5Ea2a31455952a05031C3E4BB28F3E"   # Aero FactoryRegistry: factories added later are picked up
 loan_tokens = [
   { token = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", decimals = 6 },    # USDC
-  { token = "0x4200000000000000000000000000000000000006", decimals = 18, usd_pool = "0xcDAC0d6c6C59727a65F871236188350531885C43" },   # WETH, priced on the legacy vAMM WETH/USDC
+  { token = "0x4200000000000000000000000000000000000006", decimals = 18, usd_feed = "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70" },   # WETH, priced by the Chainlink ETH/USD feed (Base)
 ]
+# usd_feed_max_age_secs = 3600       # a usd_feed not updated for this long falls back to the pool / last price
 min_profit_usd = 1.0                 # absolute floor on the exact net profit
 min_profit_bps = 20.0                # and net >= this share of the loan
 max_loan_usd = 10000.0
 priority_fee_wei = 1000000           # base priority fee (0.001 gwei); mind Aero's MEV tax on priority fees
 gas_limit = 3000000                  # only gas used is paid
 min_profit_keep = 0.5                # on-chain minProfit = exact profit x this
-max_failures_in_window = 5           # failed/dropped txs within failure_window_secs -> pause failure_cooldown_secs, then resume
+deadline_secs = 4.0                  # tx valid this long; converted to blocks with the observed block time

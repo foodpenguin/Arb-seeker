@@ -7,8 +7,9 @@ core code.
 
 ## Layout
 - `bot/` — Rust crate. Seams: `runner.rs` (`OpportunitySource` + the generic driver), `flash.rs`
-  (`FlashLoan`, `FlashAccounting`). Shared plumbing: `executor.rs`, `rpc.rs`, `heads.rs`,
-  `flashblocks.rs`, `chain.rs`, `num.rs`. Example strategy: `aero.rs`.
+  (`FlashLoan`, `FlashAccounting`). Shared plumbing: `arb_exec.rs` (`ArbExecutor`: exact check,
+  pick, bid, send terms), `executor.rs`, `rpc.rs`, `heads.rs`, `flashblocks.rs`, `chain.rs`,
+  `num.rs`. Example strategy: `aero.rs`.
 - `contracts/` — Foundry. `AeroMigrationArb.sol` (one entry point per funding source) and the
   simulation-only `sim/GridQuoter.sol`.
 - `docs/` — architecture and setup, in English and Traditional Chinese (`*.zh-TW.md`).
@@ -37,6 +38,7 @@ core code.
   `scripts/deploy_aero_arb.sh` are run by the operator. Test anything that sends on a local anvil
   fork, with `extra_broadcast = []` and a kill-switch file.
 - The arb contract: only `executor` may start an arb; each funding callback only runs inside an arb
-  funded by that very source, once; swap targets must be owner-allowlisted; a minimum profit is
+  funded by that very source, once; routers and pool factories must be owner-allowlisted, in two
+  separate lists (`allowedTarget`, `allowedFactory`); a minimum profit is
   always enforced. Keep `contracts/test/AeroMigrationArb.funding.t.sol` green.
 - The hot wallet holds gas only; profit goes to the contract's immutable receiver.

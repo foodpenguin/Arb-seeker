@@ -48,6 +48,14 @@ the Aero / legacy Aerodrome addresses (verify them on-chain; protocol migrations
 example values are placeholders to make the bot start, not recommendations: size and price for
 your own risk.
 
+- A loan token that is not a USD stablecoin needs a price: `usd_feed` (a Chainlink USD feed,
+  preferred; the example uses the Base ETH/USD feed for WETH) or `usd_pool`.
+- `[exec] mode` stays `"shadow"` until you go live; `[exec] daily_gas_budget_usd` caps the gas
+  reverted arbs may burn per UTC day.
+- `[aero] deadline_secs`: how long a tx stays valid, converted to blocks with the measured block
+  time.
+- `exec.kill_switch_file`: a relative path is resolved from the config file's directory.
+
 ## 5. Build and observe
 
 ```bash
@@ -62,13 +70,17 @@ Without `[aero] contract`, or without `--live`, nothing is ever sent. Read the j
 
 ```bash
 cargo test                                      # unit tests, incl. the runner with a mock strategy
+cargo test e2e -- --ignored --nocapture         # LOCAL anvil fork (needs anvil + `forge build`; BASE_FORK_URL
+                                                # optional): deploy, exact check, pick, send through the gates
 cd ../contracts
 forge test --no-match-contract Fork -vv         # funding guard tests, no RPC needed
 BASE_RPC_URL=<your url> forge test -j 1 -vv     # fork tests; -j 1 keeps free RPC plans under their rate limit
 ```
 
 Fork tests read the `[aero]` addresses from `bot/config.example.toml` and default to a public
-endpoint when `BASE_RPC_URL` is unset. Pass keyed URLs only through the environment.
+endpoint when `BASE_RPC_URL` is unset. They are pinned to a fixed block (archive state needed;
+`FORK_BLOCK=<n>` moves the pin, `FORK_BLOCK=0` = latest). Pass keyed URLs only through the
+environment.
 
 To try the deploy script or `--live` end to end, use a local anvil fork, a throwaway keystore, a
 kill-switch file and `extra_broadcast = []` in that test config, so nothing can reach mainnet.
@@ -88,19 +100,22 @@ process right after reading) or prompts for it. Profit goes to the contract's im
 
 1. Deploy: `./scripts/deploy_aero_arb.sh <HOT> <COLD>` (reads addresses from
    `bot/config.local.toml [aero]`, verifies them on-chain, deploys with `profitReceiver = COLD`,
-   allowlists the pool factories). Re-run with `ARB=<address>` to allowlist factories added later.
+   allowlists the pool factories with `setAllowedFactory`). Re-run with `ARB=<address>` to allowlist
+   factories added later; on a contract deployed before the separate factory list it falls back to
+   `setAllowedTarget`.
    Hand ownership to COLD when you no longer need fast allowlisting:
    `transferOwnership(COLD)` from the owner, then `./scripts/accept_ownership.sh <ARB> <COLD>`.
    These scripts sign mainnet txs: run them yourself.
 2. Put the address in `[aero] contract`; choose `funding` (a contract deployed without a V4
    PoolManager supports `"morpho"` only; the bot checks this at start).
 3. Before the first live run, set and double-check: `[aero] priority_fee_wei` and
-   `bid_max_priority_wei` (priority-fee caps), `max_loan_usd`, the profit floors, the failure
-   cooldown (`max_failures_in_window` / `failure_window_secs` / `failure_cooldown_secs`) and
-   `exec.kill_switch_file`. Keep the hot wallet balance small: it caps what failed txs can burn.
-4. Start `./target/release/arb-bot -c config.local.toml --live` yourself. The pre-flight check
-   refuses to start if the contract's executor, migration, tokens, allowlist or funding sources do
-   not match the config, or if it is paused.
+   `bid_max_priority_wei` (priority-fee caps), `[exec] daily_gas_budget_usd`, `max_loan_usd`, the
+   profit floors, the failure cooldown (`max_failures_in_window` / `failure_window_secs` /
+   `failure_cooldown_secs`) and `exec.kill_switch_file`. Keep the hot wallet balance small too.
+4. Set `[exec] mode = "live"` and start `./target/release/arb-bot -c config.local.toml --live`
+   yourself (both are required). The pre-flight check refuses to start if the contract's executor,
+   migration, tokens, allowlist or funding sources do not match the config, if its
+   `PROFIT_RECEIVER` is the hot wallet, or if it is paused.
 5. Emergency stop: create the kill-switch file, or call `pause()` on the contract from the owner or
    executor (only the owner can unpause).
 

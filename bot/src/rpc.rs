@@ -139,16 +139,23 @@ pub struct EndpointReport {
 /// JSON-RPC errors that mean "this node can't/won't serve it right now", not "the call is invalid".
 pub fn is_capacity_error(code: i64, message: &str) -> bool {
     let m = message.to_ascii_lowercase();
-    // "execution reverted" and friends are deterministic: never retry them elsewhere.
-    if m.contains("revert") || m.contains("invalid opcode") || m.contains("out of gas") {
+    // Deterministic outcomes of the call itself: every endpoint would say the same, so never fail
+    // over (or cool an endpoint down) for them.
+    // (Only the block gas limit: an endpoint's own eth_call gas cap must still fail over.)
+    const DETERMINISTIC: [&str; 9] = ["revert", "invalid opcode", "out of gas", "exceeds block gas limit", "gas required exceeds", "intrinsic gas", "insufficient funds", "nonce", "fee cap"];
+    if DETERMINISTIC.iter().any(|k| m.contains(k)) {
         return false;
     }
+    // Phrases of rate, plan, range and availability limits, not single words ("limit" alone also
+    // matches "exceeds block gas limit").
+    const CAPACITY: [&str; 26] = [
+        "gas cap", "gas limit too high", "rate limit", "ratelimit", "too many", "limit exceeded", "limit reached", "request limit", "compute units", "capacity",
+        "block range", "range too large", "range is too large", "max range", "query returned more than", "not supported",
+        "unavailable", "not available", "does not exist", "timeout", "timed out", "archive", "upgrade", "free plan", "your plan",
+        "missing trie node",
+    ];
     // -32601 = method not found: another endpoint may support it (e.g. eth_simulateV1).
-    matches!(code, -32005 | -32016 | -32090 | -32601 | 429 | 35)
-        || is_lagging_error(code, &m)
-        || ["rate", "limit", "range", "too many", "exceeded", "not supported", "unavailable", "not available", "does not exist", "timeout", "capacity", "archive", "plan", "missing trie node"]
-            .iter()
-            .any(|k| m.contains(k))
+    matches!(code, -32005 | -32016 | -32090 | -32601 | 429 | 35) || is_lagging_error(code, &m) || CAPACITY.iter().any(|k| m.contains(k))
 }
 
 /// "This endpoint does not implement the method" (so: route it elsewhere for good), as opposed
@@ -458,6 +465,18 @@ pub fn ws_from_http(url: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capacity_errors_fail_over_deterministic_ones_do_not() {
+        for m in ["You reached free plan rate limit, please upgrade", "request limit reached", "ranges over 10000 blocks are not supported on freetier", "Under the Free tier plan, you can make eth_getLogs requests with up to a 10 block range", "query returned more than 10000 results", "upstream timed out"] {
+            assert!(is_capacity_error(-32000, m), "{m}");
+        }
+        for m in ["exceeds block gas limit", "gas required exceeds allowance (30000000)", "insufficient funds for gas * price + value", "nonce too low", "execution reverted: InsufficientProfit", "max fee per gas less than block base fee: fee cap"] {
+            assert!(!is_capacity_error(-32000, m), "{m}");
+        }
+        assert!(is_capacity_error(-32000, "gas limit too high: this node caps eth_call gas"), "a node's own cap: another may serve it");
+        assert!(is_capacity_error(429, "Too Many Requests"));
+    }
 
     #[test]
     fn capacity_errors() {

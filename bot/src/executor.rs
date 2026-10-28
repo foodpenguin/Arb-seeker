@@ -418,7 +418,7 @@ impl<P: Provider> Executor<P> {
         Ok(self.provider.get_balance(self.address).await?)
     }
 
-    /// Signs and broadcasts one liquidation. Refuses while another tx is in flight or when halted.
+    /// Signs and broadcasts one tx. Refuses while another tx is in flight or when halted.
     pub async fn send(&mut self, r: SendRequest) -> Result<Inflight> {
         if self.halted() {
             bail!("executor halted after {} consecutive failures", self.consecutive_failures);
@@ -430,10 +430,9 @@ impl<P: Provider> Executor<P> {
         let mut lock = match &self.shared {
             Some(s) => match s.lock().await {
                 Ok(f) => Some(f),
-                Err(e) => {
-                    warn!(error = %e, "shared nonce file unavailable; sending without it");
-                    None
-                }
+                // Fail closed: without the lock another bot on this wallet may sign with the same
+                // nonce, and one of the two txs is lost.
+                Err(e) => bail!("shared nonce file unavailable, not sending: {e}"),
             },
             None => None,
         };
