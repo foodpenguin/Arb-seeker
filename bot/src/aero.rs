@@ -50,8 +50,10 @@ use tracing::{info, warn};
 
 use crate::{
     actor::ExecHandle,
+    contracts::{ArbStep, IAeroArb, IAeroMigration},
+    step_arb::{self, Funding},
     arb_exec::{ArbExecutor, BidPolicy, Candidate},
-    config::{AeroConfig, AeroFunding, Config},
+    config::{AeroConfig, AeroContract, AeroFunding, Config},
     chain::multicall,
     executor::{Executor, Inflight, MinProfitSlot, Outcome},
     flash::{self, FlashAccounting, FlashLoan, MorphoBlue, UniswapV4},
@@ -65,21 +67,6 @@ use crate::{
 const SIM_QUOTER: Address = address!("00000000000000000000000000000000000b0772");
 
 sol! {
-    struct ArbStep { uint256 kind; address target; address tokenIn; uint256 amountIn; uint256 patchOffset; bytes data; }
-    #[sol(rpc)]
-    interface IAeroArb {
-        function arb(address loanToken, uint256 loanAmount, ArbStep[] buy, ArbStep[] sell, uint256 minProfit, uint256 deadlineBlock) external returns (uint256);
-        function arbFlashAccounting(address loanToken, uint256 loanAmount, ArbStep[] buy, ArbStep[] sell, uint256 minProfit, uint256 deadlineBlock) external returns (uint256);
-        function MORPHO() external view returns (address);
-        function POOL_MANAGER() external view returns (address);
-        function executor() external view returns (address);
-        function PROFIT_RECEIVER() external view returns (address);
-        function paused() external view returns (bool);
-        function allowedTarget(address) external view returns (bool);
-        function allowedFactory(address) external view returns (bool);
-        function MIGRATION() external view returns (address);
-        function NEW_TOKEN() external view returns (address);
-    }
     interface ILegacyFactory { function getPool(address a, address b, bool stable) external view returns (address); }
     interface IAeroFactory { function getPool(address a, address b) external view returns (address); }
     interface IClFactory {
@@ -815,9 +802,24 @@ impl Funder {
         }
     }
 
-    /// Calldata for this source's entry point. Both take the same arguments (so the min-profit slot
-    /// is the same) and return the profit as one uint256.
-    fn encode(&self, loan_token: Address, amount: U256, buy: Vec<ArbStep>, sell: Vec<ArbStep>, deadline: u64) -> Bytes {
+    fn funding(&self) -> Funding {
+        match self {
+            Funder::Morpho(_) => Funding::Morpho,
+            Funder::V4(_) => Funding::V4,
+        }
+    }
+
+    /// Calldata for this source's entry point of the configured contract. Every entry point (both
+    /// contracts, both sources) has minProfit at the same offset (`ARB_MIN_PROFIT`) and returns the
+    /// profit as one uint256. On StepArb the migration is a step between buy and sell
+    /// (depositLiquid of the whole old-AERO balance to the contract), and old / new AERO are swept.
+    fn encode(&self, a: &AeroConfig, loan_token: Address, amount: U256, buy: Vec<ArbStep>, sell: Vec<ArbStep>, deadline: u64) -> Bytes {
+        if a.contract_kind == AeroContract::Steps {
+            let recipient = a.contract.unwrap_or_default();
+            let migrate: Bytes = IAeroMigration::depositLiquidCall { amount: U256::ZERO, recipient }.abi_encode().into();
+            let steps = buy.into_iter().chain([step_arb::call_step(a.migration, a.old_token, U256::MAX, migrate, 4)]).chain(sell).collect();
+            return step_arb::calldata(self.funding(), loan_token, amount, steps, vec![a.old_token, a.new_token], deadline);
+        }
         let (min_profit, deadline) = (U256::ZERO, U256::from(deadline));
         match self {
             Funder::Morpho(_) => IAeroArb::arbCall { loanToken: loan_token, loanAmount: amount, buy, sell, minProfit: min_profit, deadlineBlock: deadline }.abi_encode().into(),
@@ -853,8 +855,14 @@ async fn preflight<P: Provider>(p: &P, a: &AeroConfig, c: Address, signer: Addre
     anyhow::ensure!(arb.executor().call().await? == signer, "aero contract executor is not the hot wallet");
     anyhow::ensure!(arb.PROFIT_RECEIVER().call().await? != signer, "aero contract PROFIT_RECEIVER is the hot wallet: profits must go to a cold wallet");
     anyhow::ensure!(!arb.paused().call().await?, "aero contract is paused");
-    anyhow::ensure!(arb.MIGRATION().call().await? == a.migration, "aero contract MIGRATION differs from config");
-    anyhow::ensure!(arb.NEW_TOKEN().call().await? == a.new_token, "aero contract NEW_TOKEN differs from config");
+    match a.contract_kind {
+        AeroContract::Migration => {
+            anyhow::ensure!(arb.MIGRATION().call().await? == a.migration, "aero contract MIGRATION differs from config");
+            anyhow::ensure!(arb.NEW_TOKEN().call().await? == a.new_token, "aero contract NEW_TOKEN differs from config");
+        }
+        // The migration is a step: StepArb must be allowed to call it.
+        AeroContract::Steps => anyhow::ensure!(arb.allowedTarget(a.migration).call().await?, "StepArb: the Migration {} is not an allowlisted target", a.migration),
+    }
     let legacy_ok = if factory_list { arb.allowedFactory(a.legacy_factory).call().await? } else { arb.allowedTarget(a.legacy_factory).call().await? };
     anyhow::ensure!(legacy_ok, "aero contract: legacy_factory not allowlisted (buy side)");
     info!(contract = %c, funding = ?a.funding, "aero: pre-flight passed");
@@ -1391,7 +1399,7 @@ async fn tick<P: Provider + Clone>(
         for f in &funders {
             built.push((pi, f, amt));
             cands.push(Candidate {
-                calldata: f.encode(l.token, amt, buy.clone(), sell.clone(), deadline),
+                calldata: f.encode(a, l.token, amt, buy.clone(), sell.clone(), deadline),
                 // Each source at its own gas: with equal profit (both 0 fee) V4 wins on its gas
                 // saving, Morpho wherever V4 cannot fund the size.
                 gas_est: arb_gas(a, pl.buy.len() + pl.sell.len(), f),
@@ -1538,7 +1546,7 @@ mod tests {
         let fs = Funder::enabled(&a);
         assert_eq!(fs.iter().map(|f| (f.name(), f.holder())).collect::<Vec<_>>(), vec![("morpho", flash::BASE_MORPHO), ("v4", pm)], "Morpho first: it wins ties");
         let step = ArbStep { kind: U256::from(1u8), target: POOL, tokenIn: Address::repeat_byte(9), amountIn: U256::MAX, patchOffset: U256::ZERO, data: Bytes::new() };
-        let enc = |f: &Funder| f.encode(Address::repeat_byte(9), U256::from(5u8), vec![step.clone()], vec![step.clone()], 77);
+        let enc = |f: &Funder| f.encode(&AeroConfig::default(), Address::repeat_byte(9), U256::from(5u8), vec![step.clone()], vec![step.clone()], 77);
         let (m, v) = (enc(&fs[0]), enc(&fs[1]));
         assert_eq!((&m[..4], &v[..4]), (&IAeroArb::arbCall::SELECTOR[..], &IAeroArb::arbFlashAccountingCall::SELECTOR[..]));
         assert_eq!(m[4..], v[4..], "same arguments");
@@ -1721,6 +1729,17 @@ mod e2e {
     #[tokio::test]
     #[ignore = "needs anvil + network; run with --ignored"]
     async fn e2e_arb_executor_sends_a_profitable_arb_on_anvil_fork() {
+        run(AeroContract::Migration).await;
+    }
+
+    /// The same arb on the generic StepArb: the migration is one more step.
+    #[tokio::test]
+    #[ignore = "needs anvil + network; run with --ignored"]
+    async fn e2e_the_same_arb_runs_on_the_generic_step_arb() {
+        run(AeroContract::Steps).await;
+    }
+
+    async fn run(kind: AeroContract) {
         let cfg = Config::load("config.example.toml").unwrap();
         let a = &cfg.aero;
         let fork = std::env::var("BASE_FORK_URL").unwrap_or_else(|_| "https://base.gateway.tenderly.co".into());
@@ -1735,14 +1754,23 @@ mod e2e {
         // 1. Deploy as the owner would, allowlist the legacy V2 factory (pool steps) and the stand-in
         //    router (router step). The router pays 0.95 USDC per new AERO: above old AERO's price.
         let word = |x: Address| B256::left_padding_from(x.as_slice()).0;
-        let args: Vec<u8> = [MORPHO, POOL_MANAGER, a.migration, a.old_token, a.new_token, owner.address(), hot.address(), receiver].iter().flat_map(|x| word(*x)).collect();
-        let rc = owner_p.send_transaction(TransactionRequest::default().with_deploy_code(deploy_code("../contracts/out/AeroMigrationArb.sol/AeroMigrationArb.json", &args))).await.unwrap().get_receipt().await.unwrap();
+        let (artifact, ctor) = match kind {
+            AeroContract::Migration => ("../contracts/out/AeroMigrationArb.sol/AeroMigrationArb.json", vec![MORPHO, POOL_MANAGER, a.migration, a.old_token, a.new_token, owner.address(), hot.address(), receiver]),
+            AeroContract::Steps => ("../contracts/out/StepArb.sol/StepArb.json", vec![MORPHO, POOL_MANAGER, owner.address(), hot.address(), receiver]),
+        };
+        let args: Vec<u8> = ctor.iter().flat_map(|x| word(*x)).collect();
+        let rc = owner_p.send_transaction(TransactionRequest::default().with_deploy_code(deploy_code(artifact, &args))).await.unwrap().get_receipt().await.unwrap();
         let arb = rc.contract_address.expect("deployed");
         let mut rargs = [word(a.new_token), word(USDC)].concat();
         rargs.extend_from_slice(&U256::from(950_000u64).to_be_bytes::<32>());
         let rc = owner_p.send_transaction(TransactionRequest::default().with_deploy_code(deploy_code("../contracts/out/AeroMigrationArb.fork.t.sol/FixedRateRouter.json", &rargs))).await.unwrap().get_receipt().await.unwrap();
         let router = rc.contract_address.expect("router deployed");
-        for data in [IArbAdmin::setAllowedFactoryCall { factory: a.legacy_factory, allowed: true }.abi_encode(), IArbAdmin::setAllowedTargetCall { target: router, allowed: true }.abi_encode()] {
+        let mut admin = vec![IArbAdmin::setAllowedFactoryCall { factory: a.legacy_factory, allowed: true }.abi_encode(), IArbAdmin::setAllowedTargetCall { target: router, allowed: true }.abi_encode()];
+        if kind == AeroContract::Steps {
+            // The migration is a step of StepArb: a target like any other.
+            admin.push(IArbAdmin::setAllowedTargetCall { target: a.migration, allowed: true }.abi_encode());
+        }
+        for data in admin {
             assert!(owner_p.send_transaction(TransactionRequest::default().with_to(arb).with_input(data)).await.unwrap().get_receipt().await.unwrap().status());
         }
         // Fund the stand-in router with USDC (from Morpho's balance, impersonated on the fork).
@@ -1760,11 +1788,11 @@ mod e2e {
         let sell = vec![ArbStep { kind: U256::ZERO, target: router, tokenIn: a.new_token, amountIn: U256::MAX, patchOffset: U256::from(4u8), data: sell_data }];
         let n = p.get_block_number().await.unwrap();
         let base_fee = p.get_block_by_number(alloy::eips::BlockNumberOrTag::Latest).await.unwrap().unwrap().header.base_fee_per_gas.unwrap_or(0) as u128;
-        let funding = AeroConfig { funding: AeroFunding::Auto, pool_manager: Some(POOL_MANAGER), ..a.clone() };
+        let funding = AeroConfig { funding: AeroFunding::Auto, pool_manager: Some(POOL_MANAGER), contract: Some(arb), contract_kind: kind, ..a.clone() };
         let funders = Funder::enabled(&funding);
         let cands: Vec<Candidate> = funders
             .iter()
-            .map(|f| Candidate { calldata: f.encode(USDC, loan, buy.clone(), sell.clone(), n + 20), gas_est: arb_gas(a, 2, f), floor_usd: 1.0, l1_usd: 0.0 })
+            .map(|f| Candidate { calldata: f.encode(&funding, USDC, loan, buy.clone(), sell.clone(), n + 20), gas_est: arb_gas(a, 2, f), floor_usd: 1.0, l1_usd: 0.0 })
             .collect();
         let ae = ArbExecutor {
             name: "aero-e2e",
@@ -1798,7 +1826,7 @@ mod e2e {
         let (ex, mut settled) = crate::actor::spawn(ex, blocks_rx);
         let t = ae.terms(&cands[pk.index], &pk, balance, usd, call).await.expect("the wallet covers it");
         let mut budget = DailyBudget::default();
-        let kill = std::env::temp_dir().join(format!("arb-e2e-no-kill-{}", std::process::id()));
+        let kill = std::env::temp_dir().join(format!("arb-e2e-no-kill-{}-{kind:?}", std::process::id()));
         let gates = Gates { kill_switch_file: kill.to_str().unwrap(), budget: &mut budget, daily_cap_usd: 5.0, now_unix: 0 };
         let inf = ae.send(&ex, &cands[pk.index], &t, gates, n, n + 20).await.unwrap().expect("sent");
         // Each announced block makes the task look for the receipt (the fork may take a moment
@@ -1818,7 +1846,7 @@ mod e2e {
         let q = IErc20E::balanceOfCall(receiver).abi_encode();
         let got = U256::from_be_slice(&p.call(TransactionRequest::default().with_to(USDC).with_input(q)).await.unwrap()[..32]);
         assert!(got > U256::ZERO, "profit reached the receiver");
-        println!("e2e arb: tx {} via {} gas {gas_used}, profit {} USDC (6dp)", inf.hash, funders[pk.index].name(), got);
+        println!("e2e arb ({kind:?}): tx {} via {} gas {gas_used}, profit {} USDC (6dp)", inf.hash, funders[pk.index].name(), got);
 
         // 4. The gates hold: a kill-switch file stops the next send before the executor sees it.
         std::fs::write(&kill, b"stop").unwrap();

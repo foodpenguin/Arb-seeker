@@ -32,6 +32,11 @@ pub struct AeroConfig {
     /// Deployed AeroMigrationArb. Unset = observe only (spreads and estimated profits journaled).
     #[serde(default)]
     pub contract: Option<Address>,
+    /// Which contract `contract` is: "migration" (default) = AeroMigrationArb, the migration built
+    /// in between the buy and sell steps; "steps" = the generic StepArb, the migration being one
+    /// more step (its Migration must then be an allowlisted target).
+    #[serde(default)]
+    pub contract_kind: AeroContract,
     /// Where the contract's capital comes from (see flash.rs).
     #[serde(default)]
     pub funding: AeroFunding,
@@ -147,6 +152,15 @@ impl AeroLoan {
     pub fn is_priced(&self) -> bool {
         self.usd_feed.is_some() || self.usd_pool.is_some()
     }
+}
+
+/// `[aero] contract_kind`.
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AeroContract {
+    #[default]
+    Migration,
+    Steps,
 }
 
 /// `[aero] funding`.

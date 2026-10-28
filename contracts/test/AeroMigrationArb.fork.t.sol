@@ -2,7 +2,8 @@
 pragma solidity 0.8.28;
 
 import {Test} from "forge-std/Test.sol";
-import {AeroMigrationArb, ArbStep, IMorphoFlash, IPoolManager, IAeroMigration} from "../src/AeroMigrationArb.sol";
+import {AeroMigrationArb, IAeroMigration} from "../src/AeroMigrationArb.sol";
+import {FlashArbBase, ArbStep, IMorphoFlash, IPoolManager} from "../src/FlashArbBase.sol";
 
 interface IERC20T {
     function balanceOf(address) external view returns (uint256);
@@ -329,7 +330,7 @@ contract AeroMigrationArbFork is Test {
     /// Nobody but the pool being swapped right now may trigger the payment callback.
     function test_clCallbackOnlyFromActivePool() public {
         deal(USDC, address(arb), 1_000e6); // even with funds sitting there
-        vm.expectRevert(AeroMigrationArb.Unauthorized.selector);
+        vm.expectRevert(FlashArbBase.Unauthorized.selector);
         arb.uniswapV3SwapCallback(0, 1_000e6, "");
     }
 
@@ -385,13 +386,13 @@ contract AeroMigrationArbFork is Test {
 
     function test_onlyExecutor() public {
         FixedRateRouter r = _router(0.95e6);
-        vm.expectRevert(AeroMigrationArb.Unauthorized.selector);
+        vm.expectRevert(FlashArbBase.Unauthorized.selector);
         arb.arb(USDC, 1_000e6, _steps(_buy(1_000e6)), _steps(_sell(r)), 0, block.number);
     }
 
     function test_callbackOnlyInsideOwnArb() public {
         vm.prank(MORPHO);
-        vm.expectRevert(AeroMigrationArb.Unauthorized.selector);
+        vm.expectRevert(FlashArbBase.Unauthorized.selector);
         arb.onMorphoFlashLoan(1, abi.encode(new ArbStep[](0), new ArbStep[](0)));
     }
 
@@ -405,15 +406,15 @@ contract AeroMigrationArbFork is Test {
     function test_expiredAndPaused() public {
         FixedRateRouter r = _router(0.95e6);
         vm.prank(exec);
-        vm.expectRevert(AeroMigrationArb.Expired.selector);
+        vm.expectRevert(FlashArbBase.Expired.selector);
         arb.arb(USDC, 1_000e6, _steps(_buy(1_000e6)), _steps(_sell(r)), 0, block.number - 1);
         vm.prank(exec);
         arb.pause();
         vm.prank(exec);
-        vm.expectRevert(AeroMigrationArb.IsPaused.selector);
+        vm.expectRevert(FlashArbBase.IsPaused.selector);
         arb.arb(USDC, 1_000e6, _steps(_buy(1_000e6)), _steps(_sell(r)), 0, block.number);
         vm.prank(exec);
-        vm.expectRevert(AeroMigrationArb.Unauthorized.selector);
+        vm.expectRevert(FlashArbBase.Unauthorized.selector);
         arb.unpause();
     }
 
@@ -487,15 +488,15 @@ contract AeroMigrationArbFork is Test {
 
     function test_v4OnlyExecutorExpiredPaused() public {
         FixedRateRouter r = _router(0.95e6);
-        vm.expectRevert(AeroMigrationArb.Unauthorized.selector);
+        vm.expectRevert(FlashArbBase.Unauthorized.selector);
         arb.arbFlashAccounting(USDC, 1_000e6, _steps(_buy(1_000e6)), _steps(_sell(r)), 0, block.number);
         vm.prank(exec);
-        vm.expectRevert(AeroMigrationArb.Expired.selector);
+        vm.expectRevert(FlashArbBase.Expired.selector);
         arb.arbFlashAccounting(USDC, 1_000e6, _steps(_buy(1_000e6)), _steps(_sell(r)), 0, block.number - 1);
         vm.prank(exec);
         arb.pause();
         vm.prank(exec);
-        vm.expectRevert(AeroMigrationArb.IsPaused.selector);
+        vm.expectRevert(FlashArbBase.IsPaused.selector);
         arb.arbFlashAccounting(USDC, 1_000e6, _steps(_buy(1_000e6)), _steps(_sell(r)), 0, block.number);
     }
 
@@ -511,10 +512,10 @@ contract AeroMigrationArbFork is Test {
     function test_v4CallbackOnlyFromPoolManagerInsideOwnArb() public {
         deal(USDC, address(arb), 1_000e6); // even with funds sitting there
         bytes memory data = abi.encode(uint256(1_000e6), new ArbStep[](0), new ArbStep[](0));
-        vm.expectRevert(AeroMigrationArb.Unauthorized.selector);
+        vm.expectRevert(FlashArbBase.Unauthorized.selector);
         arb.unlockCallback(data);
         vm.prank(POOL_MANAGER);
-        vm.expectRevert(AeroMigrationArb.Unauthorized.selector);
+        vm.expectRevert(FlashArbBase.Unauthorized.selector);
         arb.unlockCallback(data);
     }
 
@@ -523,7 +524,7 @@ contract AeroMigrationArbFork is Test {
             IMorphoFlash(MORPHO), IPoolManager(address(0)), IAeroMigration(MIGRATION), OLD, NEW, owner, exec, receiver
         );
         vm.prank(exec);
-        vm.expectRevert(AeroMigrationArb.FundingDisabled.selector);
+        vm.expectRevert(FlashArbBase.FundingDisabled.selector);
         noV4.arbFlashAccounting(USDC, 1_000e6, new ArbStep[](0), new ArbStep[](0), 0, block.number);
     }
 }

@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
-# Deploys AeroMigrationArb on Base with the HOT keystore and allowlists the pool factories.
+# Deploys the Aero arb contract on Base with the HOT keystore and allowlists the pool factories.
 # Run it YOURSELF in your own terminal (it signs mainnet transactions).
 #
 #   ./scripts/deploy_aero_arb.sh <HOT address> <COLD address>
 #   ARB=0x... ./scripts/deploy_aero_arb.sh <HOT> <COLD>   # resume / allowlist newly added factories
+#   KIND=steps ./scripts/deploy_aero_arb.sh <HOT> <COLD>  # the generic StepArb instead of
+#                                                         # AeroMigrationArb ([aero] contract_kind =
+#                                                         # "steps"); the Migration is allowlisted too
 #
 # Addresses come from bot/config.local.toml [aero] (morpho, pool_manager, migration, old_token,
 # new_token, legacy_factory, new_factories), never from this script. pool_manager unset = deployed
@@ -23,6 +26,8 @@ ACCOUNT="${ACCOUNT:-bot-hot}"
 KEYSTORE="${KEYSTORE:-}"
 RPC="${RPC:-https://mainnet.base.org}"
 ARB="${ARB:-}"
+KIND="${KIND:-migration}"
+[[ "$KIND" == "migration" || "$KIND" == "steps" ]] || { echo "KIND must be migration or steps" >&2; exit 1; }
 NO_PM=0x0000000000000000000000000000000000000000
 
 export PATH="$PATH:$HOME/.foundry/bin"
@@ -85,7 +90,7 @@ if [[ -n "$ARB" ]]; then
   ARB=$(cast to-check-sum-address "$ARB")
   wait_eq "$HOT" "$ARB" 'executor()(address)' || die "executor != HOT"
   wait_eq "$COLD" "$ARB" 'PROFIT_RECEIVER()(address)' || die "PROFIT_RECEIVER != COLD"
-  wait_eq "$MIG" "$ARB" 'MIGRATION()(address)' || die "MIGRATION mismatch"
+  if [[ "$KIND" == "migration" ]]; then wait_eq "$MIG" "$ARB" 'MIGRATION()(address)' || die "MIGRATION mismatch"; fi
   # Only a note: resuming is for allowlisting, which a deployment from before V4 funding (no
   # POOL_MANAGER()) still needs. The bot's funding check refuses v4/auto on such a contract.
   GOT_PM=$(rd "$ARB" 'POOL_MANAGER()(address)')
@@ -111,7 +116,11 @@ echo "HOT balance: $(cast to-unit "$BAL" ether) ETH"
 NONCE=$(cast nonce "$HOT" --block pending --rpc-url "$RPC")
 
 TODO=()
-[[ -z "$ARB" ]] && TODO+=("deploy AeroMigrationArb(morpho=$MORPHO, poolManager=$PM, owner=HOT, executor=HOT, profitReceiver=$COLD)")
+if [[ -z "$ARB" && "$KIND" == "steps" ]]; then
+  TODO+=("deploy StepArb(morpho=$MORPHO, poolManager=$PM, owner=HOT, executor=HOT, profitReceiver=$COLD)")
+elif [[ -z "$ARB" ]]; then
+  TODO+=("deploy AeroMigrationArb(morpho=$MORPHO, poolManager=$PM, owner=HOT, executor=HOT, profitReceiver=$COLD)")
+fi
 # Pool factories go in their own allowlist (allowedFactory). A deployment from before that split has
 # no allowedFactory(): it keeps factories in allowedTarget, so a resume uses that one.
 LIST=Factory
@@ -123,6 +132,12 @@ TARGETS=()
 for f in "$LEGF" "${NEWF[@]}" "${LCL[@]}"; do
   if [[ -z "$ARB" || "$(rd "$ARB" "allowed$LIST(address)(bool)" "$f")" != "true" ]]; then TARGETS+=("$f"); TODO+=("setAllowed$LIST($f, true)"); fi
 done
+# StepArb runs the migration as a step: the Migration is one of its targets.
+MIG_TARGET=0
+if [[ "$KIND" == "steps" ]] && { [[ -z "$ARB" ]] || [[ "$(rd "$ARB" 'allowedTarget(address)(bool)' "$MIG")" != "true" ]]; }; then
+  MIG_TARGET=1
+  TODO+=("setAllowedTarget($MIG, true)  (the Migration, a step of StepArb)")
+fi
 [[ ${#TODO[@]} -gt 0 ]] || { echo "nothing to do: deployed and every factory allowlisted"; exit 0; }
 printf '\nAbout to send %d MAINNET transaction(s) from HOT %s:\n' "${#TODO[@]}" "$HOT"
 printf '  - %s\n' "${TODO[@]}"
@@ -134,8 +149,13 @@ if [[ -z "$ARB" ]]; then
   (cd "$REPO/contracts" && forge build >/dev/null 2>&1) || die "forge build failed"
   EXPECT=$(cast compute-address "$HOT" --nonce "$NONCE" | awk '{print $NF}')
   echo "deploying to $EXPECT (if anything below fails, resume with: ARB=$EXPECT $0 $HOT $COLD)"
-  OUT=$(cd "$REPO/contracts" && forge create src/AeroMigrationArb.sol:AeroMigrationArb --rpc-url "$RPC" "${SIGNER[@]}" --password-file "$PWF" --broadcast \
-    --nonce "$NONCE" --constructor-args "$MORPHO" "$PM" "$MIG" "$OLD" "$NEW" "$HOT" "$HOT" "$COLD") || die "forge create failed; check $EXPECT, then resume with ARB=$EXPECT"
+  if [[ "$KIND" == "steps" ]]; then
+    OUT=$(cd "$REPO/contracts" && forge create src/StepArb.sol:StepArb --rpc-url "$RPC" "${SIGNER[@]}" --password-file "$PWF" --broadcast \
+      --nonce "$NONCE" --constructor-args "$MORPHO" "$PM" "$HOT" "$HOT" "$COLD") || die "forge create failed; check $EXPECT, then resume with KIND=steps ARB=$EXPECT"
+  else
+    OUT=$(cd "$REPO/contracts" && forge create src/AeroMigrationArb.sol:AeroMigrationArb --rpc-url "$RPC" "${SIGNER[@]}" --password-file "$PWF" --broadcast \
+      --nonce "$NONCE" --constructor-args "$MORPHO" "$PM" "$MIG" "$OLD" "$NEW" "$HOT" "$HOT" "$COLD") || die "forge create failed; check $EXPECT, then resume with ARB=$EXPECT"
+  fi
   ARB=$(awk '/Deployed to:/{print $3}' <<<"$OUT")
   same "$ARB" "$EXPECT" || die "deployed to '$ARB', expected $EXPECT"
   NONCE=$((NONCE + 1))
@@ -150,12 +170,17 @@ for f in "${TARGETS[@]}"; do
   send "setAllowed$LIST" "$ARB" "setAllowed$LIST(address,bool)" "$f" true
   wait_eq true "$ARB" "allowed$LIST(address)(bool)" "$f" || die "$f not allowlisted"
 done
+if [[ "$MIG_TARGET" == 1 ]]; then
+  say "setAllowedTarget($MIG) (Migration)"
+  send "setAllowedTarget" "$ARB" "setAllowedTarget(address,bool)" "$MIG" true
+  wait_eq true "$ARB" "allowedTarget(address)(bool)" "$MIG" || die "Migration not allowlisted"
+fi
 
 rm -f "$PWF"
 cat <<EOF
 
-==> DONE. AeroMigrationArb: $ARB
-Put it in bot/config.local.toml:   [aero] contract = "$ARB"
+==> DONE. $( [[ "$KIND" == "steps" ]] && echo StepArb || echo AeroMigrationArb ): $ARB
+Put it in bot/config.local.toml:   [aero] contract = "$ARB"$( [[ "$KIND" == "steps" ]] && printf '\n                                   [aero] contract_kind = "steps"' )
 Then (dry run first, then live), from bot/:
   ./target/release/arb-bot -c config.local.toml
   ./target/release/arb-bot -c config.local.toml --live

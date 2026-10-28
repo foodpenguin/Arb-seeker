@@ -2,7 +2,8 @@
 pragma solidity 0.8.28;
 
 import {Test} from "forge-std/Test.sol";
-import {AeroMigrationArb, ArbStep, IMorphoFlash, IPoolManager, IAeroMigration} from "../src/AeroMigrationArb.sol";
+import {AeroMigrationArb, IAeroMigration} from "../src/AeroMigrationArb.sol";
+import {FlashArbBase, ArbStep, IMorphoFlash, IPoolManager} from "../src/FlashArbBase.sol";
 
 contract MockToken {
     mapping(address => uint256) public balanceOf;
@@ -111,23 +112,23 @@ contract AeroMigrationArbFundingTest is Test {
     }
 
     function test_morphoArbRejectsTheV4Callback() public {
-        _run(EvilFunder.Mode.Cross, false, AeroMigrationArb.Unauthorized.selector);
+        _run(EvilFunder.Mode.Cross, false, FlashArbBase.Unauthorized.selector);
     }
 
     function test_v4ArbRejectsTheMorphoCallback() public {
-        _run(EvilFunder.Mode.Cross, true, AeroMigrationArb.Unauthorized.selector);
+        _run(EvilFunder.Mode.Cross, true, FlashArbBase.Unauthorized.selector);
     }
 
     function test_morphoCallbackRunsOnce() public {
-        _run(EvilFunder.Mode.Twice, false, AeroMigrationArb.Unauthorized.selector);
+        _run(EvilFunder.Mode.Twice, false, FlashArbBase.Unauthorized.selector);
     }
 
     function test_v4CallbackRunsOnce() public {
-        _run(EvilFunder.Mode.Twice, true, AeroMigrationArb.Unauthorized.selector);
+        _run(EvilFunder.Mode.Twice, true, FlashArbBase.Unauthorized.selector);
     }
 
     function test_funderThatNeverCallsBackReverts() public {
-        _run(EvilFunder.Mode.Silent, false, AeroMigrationArb.NotFunded.selector);
-        _run(EvilFunder.Mode.Silent, true, AeroMigrationArb.NotFunded.selector);
+        _run(EvilFunder.Mode.Silent, false, FlashArbBase.NotFunded.selector);
+        _run(EvilFunder.Mode.Silent, true, FlashArbBase.NotFunded.selector);
     }
 }
