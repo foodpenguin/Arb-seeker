@@ -15,7 +15,10 @@ curl -L https://foundry.paradigm.xyz | bash && ~/.foundry/bin/foundryup  # forge
 
 ## 2. 取得程式碼
 
+bot 以路徑依賴 `onchain-core` crate，所以兩個 repo 要並排 clone：
+
 ```bash
+git clone <onchain-core-url> onchain-core
 git clone --recurse-submodules <repo-url> arbitrage-framework
 cd arbitrage-framework
 git submodule update --init --recursive    # 如果 clone 時沒加 --recurse-submodules（forge-std）
@@ -58,7 +61,8 @@ cargo build --release
 ```bash
 cargo test                                      # 單元測試，包含用假策略跑的 runner 測試
 cargo test e2e -- --ignored --nocapture         # 本地 anvil fork（需要 anvil 和 `forge build`；BASE_FORK_URL 可選）：
-                                                # 部署、精確檢查、挑選、經過各道關卡送單
+                                                # 部署、精確檢查、挑選、經過各道關卡送單，
+                                                # AeroMigrationArb 和 StepArb 都測
 cd ../contracts
 forge test --no-match-contract Fork -vv         # 資金防護測試，不需 RPC
 BASE_RPC_URL=<你的 url> forge test -j 1 -vv     # fork 測試；-j 1 避免免費方案的 RPC 被限流
@@ -78,10 +82,10 @@ cast wallet import bot-hot --interactive   # 熱錢包：只放 gas
 
 ## 8. 實跑（只能由 operator 執行）
 
-1. 部署：`./scripts/deploy_aero_arb.sh <HOT> <COLD>`（從 `bot/config.local.toml [aero]` 讀取地址、在鏈上核對、以 `profitReceiver = COLD` 部署、用 `setAllowedFactory` 把池子的 factory 加入白名單）。之後新增的 factory 可以用 `ARB=<地址>` 重跑來加入白名單；如果合約是在 factory 白名單獨立出來之前部署的，腳本會改用 `setAllowedTarget`。不再需要快速加白名單時，把 owner 交給 COLD：由 owner 呼叫 `transferOwnership(COLD)`，再執行 `./scripts/accept_ownership.sh <ARB> <COLD>`。這些腳本會簽主網交易，請自己執行。
+1. 部署：`./scripts/deploy_aero_arb.sh <HOT> <COLD>`（從 `bot/config.local.toml [aero]` 讀取地址、在鏈上核對、以 `profitReceiver = COLD` 部署、用 `setAllowedFactory` 把池子的 factory 加入白名單）。之後新增的 factory 可以用 `ARB=<地址>` 重跑來加入白名單；如果合約是在 factory 白名單獨立出來之前部署的，腳本會改用 `setAllowedTarget`。`KIND=steps` 改為部署通用的 StepArb（並把 Migration 加入 target 白名單）；用它時要設定 `[aero] contract_kind = "steps"`。不再需要快速加白名單時，把 owner 交給 COLD：由 owner 呼叫 `transferOwnership(COLD)`，再執行 `./scripts/accept_ownership.sh <ARB> <COLD>`。這些腳本會簽主網交易，請自己執行。
 2. 把地址填進 `[aero] contract`；選擇 `funding`（部署時沒有 V4 PoolManager 的合約只支援 `"morpho"`；bot 啟動時會檢查）。
 3. 第一次實跑前，設定並再次確認：`[aero] priority_fee_wei` 和 `bid_max_priority_wei`（priority fee 上限）、`[exec] daily_gas_budget_usd`、`max_loan_usd`、利潤門檻、失敗冷卻（`max_failures_in_window` / `failure_window_secs` / `failure_cooldown_secs`），以及 `exec.kill_switch_file`。熱錢包的餘額也要保持少量。
 4. 設定 `[exec] mode = "live"`，並由你本人啟動 `./target/release/arb-bot -c config.local.toml --live`（兩者缺一不可）。合約的 executor、遷移合約、代幣、白名單或資金來源和設定不一致、`PROFIT_RECEIVER` 是熱錢包，或合約被暫停時，pre-flight 檢查會拒絕啟動。
 5. 緊急停止：建立緊急停止檔案，或由 owner 或 executor 呼叫合約的 `pause()`（只有 owner 能解除）。
 
-如果還有其他 bot 用同一個熱錢包簽名，兩邊都把 `exec.nonce_file` 留空，它們就會共用以錢包為單位的 nonce 鎖（`~/.local/state/onchain-bots/nonce-<錢包>`）。
+如果還有其他 bot 用同一個熱錢包簽名，兩邊都把 `exec.nonce_file` 留空，它們就會共用以錢包為單位的 nonce 鎖（`~/.local/state/onchain-bots/nonce-<錢包>`）。兩者都必須建立在同一個 `onchain-core` nonce 檔版本（`v1`）上：遇到不認得的格式時，bot 會拒絕送單。

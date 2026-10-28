@@ -11,6 +11,8 @@ safety come before features.
   two funding models (`FlashLoan`, `FlashAccounting`) and the arb contract's security model.
 - For a larger change (a new strategy, a new funding source, a contract change), open an issue first
   to agree on the approach.
+- The chain plumbing (RPC pool, executor, gates, simulation) lives in `onchain-core`, a separate
+  repository checked out next to this one; a change there is a pull request there.
 
 ## Development setup
 

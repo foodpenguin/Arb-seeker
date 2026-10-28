@@ -16,7 +16,10 @@ curl -L https://foundry.paradigm.xyz | bash && ~/.foundry/bin/foundryup  # forge
 
 ## 2. Code
 
+The bot builds on the `onchain-core` crate (by path), so clone both side by side:
+
 ```bash
+git clone <onchain-core-url> onchain-core
 git clone --recurse-submodules <repo-url> arbitrage-framework
 cd arbitrage-framework
 git submodule update --init --recursive    # if you cloned without --recurse-submodules (forge-std)
@@ -71,7 +74,8 @@ Without `[aero] contract`, or without `--live`, nothing is ever sent. Read the j
 ```bash
 cargo test                                      # unit tests, incl. the runner with a mock strategy
 cargo test e2e -- --ignored --nocapture         # LOCAL anvil fork (needs anvil + `forge build`; BASE_FORK_URL
-                                                # optional): deploy, exact check, pick, send through the gates
+                                                # optional): deploy, exact check, pick, send through the gates,
+                                                # for AeroMigrationArb and for StepArb
 cd ../contracts
 forge test --no-match-contract Fork -vv         # funding guard tests, no RPC needed
 BASE_RPC_URL=<your url> forge test -j 1 -vv     # fork tests; -j 1 keeps free RPC plans under their rate limit
@@ -102,7 +106,8 @@ process right after reading) or prompts for it. Profit goes to the contract's im
    `bot/config.local.toml [aero]`, verifies them on-chain, deploys with `profitReceiver = COLD`,
    allowlists the pool factories with `setAllowedFactory`). Re-run with `ARB=<address>` to allowlist
    factories added later; on a contract deployed before the separate factory list it falls back to
-   `setAllowedTarget`.
+   `setAllowedTarget`. `KIND=steps` deploys the generic StepArb instead (and allowlists the
+   Migration as a target); set `[aero] contract_kind = "steps"` for it.
    Hand ownership to COLD when you no longer need fast allowlisting:
    `transferOwnership(COLD)` from the owner, then `./scripts/accept_ownership.sh <ARB> <COLD>`.
    These scripts sign mainnet txs: run them yourself.
@@ -120,4 +125,5 @@ process right after reading) or prompts for it. Profit goes to the contract's im
    executor (only the owner can unpause).
 
 If another bot signs with the same hot wallet, leave `exec.nonce_file` empty in both so they share
-the per-wallet nonce lock (`~/.local/state/onchain-bots/nonce-<wallet>`).
+the per-wallet nonce lock (`~/.local/state/onchain-bots/nonce-<wallet>`). Both must be built on the
+same `onchain-core` nonce-file version (`v1`): a bot that finds an unknown format refuses to send.
