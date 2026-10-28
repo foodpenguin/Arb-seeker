@@ -1,0 +1,82 @@
+# Example configuration (Base mainnet, Aero merger arbitrage). Copy to config.local.toml
+# (git-ignored) and adjust. Only keys the arb code reads are here; see src/config.rs for every option
+# and its default. Every number below is a neutral starting point, not a tuned value.
+chain_id = 8453
+
+# RPC endpoints. URLs with API keys live in ../.env (git-ignored); the config only names the
+# environment variables (`http_env`). Logs show endpoint names, never URLs. Endpoints are grouped by
+# `priority` (0 = first tier; higher tiers are failover only).
+env_file = "../.env"
+
+[[rpc]]
+name = "primary"               # a keyed provider (eth_simulateV1 is needed for same-block mode)
+http_env = "BASE_RPC_1"
+priority = 0
+ws = "derive"                  # derive the WS URL from the HTTP one (wss://...), for newHeads
+
+[[rpc]]
+name = "secondary"             # a second keyed provider
+http_env = "BASE_RPC_2"
+priority = 0
+
+[[rpc]]
+name = "public"                # public endpoint: failover only
+http = "https://mainnet.base.org"
+priority = 2
+skip_methods = ["eth_simulateV1", "eth_getLogs"]
+
+[exec]
+executor = "0x000000000000000000000000000000000000dEaD"   # hot wallet ADDRESS only, never the key
+# keystore = "/home/<you>/.foundry/keystores/bot-hot"   # created with `cast wallet import bot-hot --interactive`
+# keystore_password_env = "BOT_KEYSTORE_PASSWORD"       # read once, then removed; else a prompt
+# extra_broadcast = ["https://mainnet-sequencer.base.org"]   # opt-in; never in a fork/test config
+eth_usd_fallback = 2400.0      # values gas and WETH-priced loans until an on-chain price is read
+# kill_switch_file = "data/KILL"   # if this file exists, nothing is sent
+# nonce_file = ""                  # default: ~/.local/state/onchain-bots/nonce-<wallet>, shared by every
+#                                  # bot signing with this wallet. Keep it empty: a relative path only
+#                                  # coordinates with bots started from the same directory.
+
+[router]
+# quoter_artifact = "../contracts/out/GridQuoter.sol/GridQuoter.json"   # `forge build` in contracts/
+
+[flashblocks]
+ws = "wss://mainnet.flashblocks.base.org/ws"   # same-block quoting ([aero] same_block)
+
+# Aero merger arbitrage, the example strategy: old AERO converts 1:1 into new AERO; when old trades
+# below new, buy old, migrate, sell new, repay, in one tx. Cross-check every address with Aero's
+# official list before going live.
+[aero]
+# rpc = ["primary"]                  # endpoints for this strategy, in strict order (default: the pool)
+same_block = false                   # also quote + send on the in-progress block (Base flashblocks; needs eth_simulateV1)
+same_block_last_index = 6            # same-block passes only up to this flashblock index
+bid_min_profit_usd = 10.0            # exact profit at least this -> bid part of it as priority fee
+bid_share = 0.1                      # up to this share of the profit (never past net - floor); a bid is paid on a revert too
+bid_max_priority_wei = 100000000     # priority fee cap. Aero pools tax priority fees (MEV tax): check it before raising this
+# contract = "0x..."                 # AeroMigrationArb, after scripts/deploy_aero_arb.sh; unset = observe only
+# Funding (both 0 fee): "morpho" = Morpho Blue flash loan (arb()); "v4" = Uniswap V4 PoolManager flash
+# accounting (arbFlashAccounting()); "auto" = exact-check both (2x eth_calls per opportunity) and send
+# the higher net (V4 is ~21k gas cheaper; Morpho is usually deeper). v4/auto need a contract deployed
+# with pool_manager.
+funding = "morpho"
+morpho = "0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb"         # Morpho Blue (Base)
+pool_manager = "0x498581fF718922c3f8e6A244956aF099B2652b2b"   # Uniswap V4 PoolManager (Base)
+migration = "0x22a2F7340a3fB4C7C389D91eE954766B12476721"
+old_token = "0x940181a94A35A4569E4529A3CDfB74e38FD98631"   # legacy AERO
+new_token = "0x3f5bF3EdAc59d650D8fDf9657a71F2f904A3a4Ee"   # new AERO
+legacy_factory = "0x420DD381b31aEf6683db6B902084cB0FFECe40Da"   # legacy Aerodrome V2 PoolFactory (buy side)
+# Legacy Aerodrome Slipstream (CL) factories: more buy side (old AERO), straight on their pools
+legacy_cl_factories = ["0x5e7BB104d84c7CB9B682AaC2F3d509f5F406809A", "0xaDe65c38CD4849aDBA595a4323a8C7DdfE89716a", "0xF8f2eB4940CFE7d13603DDDD87f123820Fc061EF"]
+# Aero pool factories (sell side, V2 + CL; CL ones answer tickSpacings())
+new_factories = ["0x8E6a9FCd1d638CC760Ffba397605Fe3355dE76D2", "0x9CB220581b91b0C83223012FE69688b92aD07a76", "0x9bc8b3F60D349d687Fb44A018967025E3741F9a5", "0xC6bdE6e9F0CD71013E5FcF2dAAE2fA1c71Bb2F25"]
+factory_registry = "0x7b2A2c12dC5Ea2a31455952a05031C3E4BB28F3E"   # Aero FactoryRegistry: factories added later are picked up
+loan_tokens = [
+  { token = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", decimals = 6 },    # USDC
+  { token = "0x4200000000000000000000000000000000000006", decimals = 18, usd_pool = "0xcDAC0d6c6C59727a65F871236188350531885C43" },   # WETH, priced on the legacy vAMM WETH/USDC
+]
+min_profit_usd = 1.0                 # absolute floor on the exact net profit
+min_profit_bps = 20.0                # and net >= this share of the loan
+max_loan_usd = 10000.0
+priority_fee_wei = 1000000           # base priority fee (0.001 gwei); mind Aero's MEV tax on priority fees
+gas_limit = 3000000                  # only gas used is paid
+min_profit_keep = 0.5                # on-chain minProfit = exact profit x this
+max_failures_in_window = 5           # failed/dropped txs within failure_window_secs -> pause failure_cooldown_secs, then resume

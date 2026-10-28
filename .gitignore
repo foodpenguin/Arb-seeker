@@ -1,0 +1,25 @@
+# Rust / Foundry build
+target/
+bot/target/
+contracts/out/
+contracts/cache/
+contracts/broadcast/
+
+# Secrets & local config (never commit)
+.env
+.env.*
+!.env.example
+*.keystore
+keystore/
+keystores/
+bot/config*.local.toml
+bot/data/
+
+# Local research notes (not part of the framework)
+research/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
