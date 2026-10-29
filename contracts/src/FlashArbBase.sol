@@ -24,6 +24,7 @@ interface IPoolManager {
 interface ISolidlyPool {
     function factory() external view returns (address);
     function token0() external view returns (address);
+    function token1() external view returns (address);
     function getAmountOut(uint256 amountIn, address tokenIn) external view returns (uint256);
     function getAmountOutWithTotalFee(uint256 amountIn, address tokenIn) external view returns (uint256);
     function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
@@ -52,9 +53,13 @@ interface IClFactory {
 ///           allowlisted factory (`isPool`); the input is sent to it and the output computed with
 ///           `getAmountOut` (1: legacy Aerodrome) or `getAmountOutWithTotalFee` (2: Aero pools,
 ///           dynamic + MEV fee), in the same tx, so no quote can go stale. `data` is unused.
-///         kind 3 (CL pool, direct: Uniswap V3 / Slipstream / Aero CL): `target` is the pool. Its
+///         kind 3 (CL pool, direct: Aerodrome Slipstream / Aero CL): `target` is the pool. Its
 ///           factory must be allowlisted and return this exact pool from getPool(token0, token1,
 ///           tickSpacing); the pool is paid inside its own swap callback, at most `amountIn`.
+///           Uniswap V3 / PancakeSwap V3 pools are not supported: their factories key pools by
+///           fee, not tick spacing, and PancakeSwap calls back `pancakeV3SwapCallback`.
+///         Every step's `tokenIn` is swept to PROFIT_RECEIVER after the arb, so whatever a step did
+///         not spend (a partial fill, exact-input rounding) never stays at rest.
 struct ArbStep {
     uint256 kind;
     address target;
@@ -83,7 +88,7 @@ struct ArbStep {
 ///        took;
 ///      - the tx reverts unless the loan-token balance left after repayment is at least
 ///        `minProfit`; profit goes to the immutable PROFIT_RECEIVER (the contract holds nothing at
-///        rest: each contract sweeps its intermediate tokens).
+///        rest: every step's input token is swept afterwards, plus what each contract adds).
 abstract contract FlashArbBase {
     uint256 internal constant FUND_MORPHO = 1;
     uint256 internal constant FUND_V4 = 2;
@@ -119,6 +124,7 @@ abstract contract FlashArbBase {
     error TokenCallFailed(address token);
     error BadPatch();
     error BadKind();
+    error BadAmount();
     error FundingDisabled();
     error NotFunded();
 
@@ -225,22 +231,27 @@ abstract contract FlashArbBase {
 
     /// @dev Exact-input swap straight on a Solidly-style pool of an allowlisted factory. A fake
     ///      pool cannot pass: its factory() may claim an allowlisted factory, but that factory's
-    ///      isPool() must confirm it.
+    ///      isPool() must confirm it. `tokenIn` must be one of the pool's two tokens.
     function _poolSwap(ArbStep memory s, uint256 amount) private {
         ISolidlyPool pool = ISolidlyPool(s.target);
         address f = pool.factory();
         if (!allowedFactory[f] || !ISolidlyFactory(f).isPool(s.target)) revert TargetNotAllowed(s.target);
+        address t0 = pool.token0();
+        if (s.tokenIn != t0 && s.tokenIn != pool.token1()) revert TargetNotAllowed(s.target);
         uint256 out = s.kind == 1 ? pool.getAmountOut(amount, s.tokenIn) : pool.getAmountOutWithTotalFee(amount, s.tokenIn);
         // 1 ppm below the quote: guards against fee rounding between the view and swap().
         out -= out / 1_000_000 + 1;
         _safeTransfer(s.tokenIn, s.target, amount);
-        if (s.tokenIn == pool.token0()) pool.swap(0, out, address(this), "");
+        if (s.tokenIn == t0) pool.swap(0, out, address(this), "");
         else pool.swap(out, 0, address(this), "");
     }
 
     /// @dev Exact-input swap straight on a CL pool. A fake pool cannot pass: its factory() may claim
     ///      an allowlisted factory, but that factory's getPool must return this very address.
+    ///      `amount` must fit a positive int256: a larger one would wrap negative and turn the swap
+    ///      into an exact-output one.
     function _clSwap(ArbStep memory s, uint256 amount) private {
+        if (amount > uint256(type(int256).max)) revert BadAmount();
         IV3Pool pool = IV3Pool(s.target);
         address f = IClPool(s.target).factory();
         address t0 = pool.token0();
@@ -319,6 +330,13 @@ abstract contract FlashArbBase {
     function _sweep(address token) internal {
         uint256 b = IERC20Bal(token).balanceOf(address(this));
         if (b > 0) _safeTransfer(token, PROFIT_RECEIVER, b);
+    }
+
+    /// @dev Sweeps every step's `tokenIn`. Only after `_finish`: the loan token is among them.
+    function _sweepInputs(ArbStep[] calldata steps) internal {
+        for (uint256 i; i < steps.length; ++i) {
+            _sweep(steps[i].tokenIn);
+        }
     }
 
     function _forceApprove(address token, address spender, uint256 amount) internal {

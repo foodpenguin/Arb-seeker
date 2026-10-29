@@ -63,6 +63,79 @@ contract Converter {
     }
 }
 
+/// Answers both kinds of factory checks: Solidly `isPool` and CL `getPool`.
+contract PoolFactory {
+    mapping(address => bool) public isPool;
+    address public clPool;
+
+    function add(address pool, bool cl) external {
+        isPool[pool] = true;
+        if (cl) clPool = pool;
+    }
+
+    function getPool(address, address, int24) external view returns (address) {
+        return clPool;
+    }
+}
+
+/// Solidly-style pool quoting 1:2 either way; swap() pays out without checking its input (a real
+/// pool's K check is not modeled).
+contract SolidlyPool {
+    address public immutable factory;
+    SToken public immutable token0;
+    SToken public immutable token1;
+
+    constructor(address f, SToken t0, SToken t1) {
+        (factory, token0, token1) = (f, t0, t1);
+    }
+
+    function getAmountOut(uint256 amountIn, address) external pure returns (uint256) {
+        return 2 * amountIn;
+    }
+
+    function getAmountOutWithTotalFee(uint256 amountIn, address) external pure returns (uint256) {
+        return 2 * amountIn;
+    }
+
+    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata) external {
+        if (amount0Out > 0) token0.mint(to, amount0Out);
+        if (amount1Out > 0) token1.mint(to, amount1Out);
+    }
+}
+
+/// CL pool swapping 1:2, exact input only; takes only `fillPct`% of the input (as a real pool does
+/// when it runs out of liquidity before the price limit) and checks it was paid in the callback.
+contract ClPool {
+    address public immutable factory;
+    SToken public immutable token0;
+    SToken public immutable token1;
+    int24 public constant tickSpacing = 1;
+    int256 public fillPct = 100;
+
+    constructor(address f, SToken t0, SToken t1) {
+        (factory, token0, token1) = (f, t0, t1);
+    }
+
+    function setFill(int256 pct) external {
+        fillPct = pct;
+    }
+
+    function swap(address to, bool zeroForOne, int256 amountSpecified, uint160, bytes calldata data)
+        external
+        returns (int256 amount0, int256 amount1)
+    {
+        require(amountSpecified > 0, "exact input only");
+        int256 taken = amountSpecified * fillPct / 100;
+        (amount0, amount1) = zeroForOne ? (taken, -2 * taken) : (-2 * taken, taken);
+        (SToken tin, SToken tout) = zeroForOne ? (token0, token1) : (token1, token0);
+        uint256 amountIn = uint256(taken);
+        tout.mint(to, 2 * amountIn);
+        uint256 before = tin.balanceOf(address(this));
+        FlashArbBase(msg.sender).uniswapV3SwapCallback(amount0, amount1, data);
+        require(tin.balanceOf(address(this)) >= before + amountIn, "not paid");
+    }
+}
+
 /// Plays Morpho AND the PoolManager (honestly, unless armed otherwise): lends `loan`, calls back,
 /// takes the repayment.
 contract Funder {
@@ -157,14 +230,78 @@ contract StepArbSecurityTest is Test {
         assertEq(a.allowance(address(arb), address(router)) + b.allowance(address(arb), address(conv)), 0, "allowances reset");
     }
 
-    function test_leftoversOfTheSweepListGoToTheReceiver() public {
-        // Without b in the sweep list its dust would stay; with it, nothing does.
+    function test_stepInputsAreSweptWithoutASweepList() public {
         vm.prank(exec);
         arb.arb(address(a), 100, _steps(), new address[](0), 0, block.number);
-        assertEq(b.balanceOf(address(arb)), 1);
-        _run(false, 0);
-        assertEq(b.balanceOf(address(arb)), 0, "the next run converted the old dust...");
-        assertEq(b.balanceOf(receiver), 1, "...and swept the new");
+        assertEq(b.balanceOf(address(arb)), 0, "b is step 2's input: its dust is swept");
+        assertEq(b.balanceOf(receiver), 1);
+    }
+
+    function test_theSweepListAddsTokensNoStepTakes() public {
+        SToken c = new SToken();
+        c.mint(address(arb), 5);
+        address[] memory t = new address[](1);
+        t[0] = address(c);
+        vm.prank(exec);
+        arb.arb(address(a), 100, _steps(), t, 0, block.number);
+        assertEq(c.balanceOf(address(arb)), 0);
+        assertEq(c.balanceOf(receiver), 5);
+    }
+
+    /// Step 1 on `pool` (kind 1-3) sells 100 of `tokenIn` (max = whole balance), step 2 converts b
+    /// back into a.
+    function _poolSteps(uint256 kind, address pool, address tokenIn, uint256 amountIn)
+        internal
+        view
+        returns (ArbStep[] memory s)
+    {
+        s = _steps();
+        s[0] = ArbStep({kind: kind, target: pool, tokenIn: tokenIn, amountIn: amountIn, patchOffset: 0, data: ""});
+    }
+
+    function _withFactory() internal returns (PoolFactory f) {
+        f = new PoolFactory();
+        vm.prank(owner);
+        arb.setAllowedFactory(address(f), true);
+    }
+
+    function test_poolStepTokenInMustBeOneOfThePoolsTokens() public {
+        PoolFactory f = _withFactory();
+        SolidlyPool pool = new SolidlyPool(address(f), a, b);
+        f.add(address(pool), false);
+        vm.prank(exec);
+        assertEq(arb.arb(address(a), 100, _poolSteps(1, address(pool), address(a), 100), _sweep(), 0, block.number), 98, "control: 2 x 100 - 1 - 1 - 100");
+
+        // A token that is neither token0 nor token1 would otherwise be sent in and token0 asked out.
+        SToken c = new SToken();
+        c.mint(address(arb), 100);
+        vm.prank(exec);
+        vm.expectRevert(abi.encodeWithSelector(FlashArbBase.TargetNotAllowed.selector, address(pool)));
+        arb.arb(address(a), 100, _poolSteps(1, address(pool), address(c), 100), _sweep(), 0, block.number);
+    }
+
+    function test_clPartialFillLeftoverIsSwept() public {
+        PoolFactory f = _withFactory();
+        ClPool pool = new ClPool(address(f), b, a);
+        f.add(address(pool), true);
+        pool.setFill(50);
+        // a -> 200 b (router), then all b on the CL pool, which takes only 100 b and pays 200 a.
+        ArbStep[] memory s = _steps();
+        s[1] = ArbStep({kind: 3, target: address(pool), tokenIn: address(b), amountIn: type(uint256).max, patchOffset: 0, data: ""});
+        vm.prank(exec);
+        assertEq(arb.arb(address(a), 100, s, new address[](0), 0, block.number), 100);
+        assertEq(b.balanceOf(address(arb)), 0, "the unsold 100 b is the step's input: swept");
+        assertEq(b.balanceOf(receiver), 100);
+    }
+
+    function test_clAmountMustFitInt256() public {
+        PoolFactory f = _withFactory();
+        ClPool pool = new ClPool(address(f), a, b);
+        f.add(address(pool), true);
+        // 2^255 would wrap to a negative int256: an exact-output swap with no cap on what it pays.
+        vm.prank(exec);
+        vm.expectRevert(abi.encodeWithSignature("BadAmount()"));
+        arb.arb(address(a), 100, _poolSteps(3, address(pool), address(a), uint256(1) << 255), _sweep(), 0, block.number);
     }
 
     function test_minProfitIsEnforced() public {

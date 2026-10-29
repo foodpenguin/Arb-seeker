@@ -47,10 +47,10 @@ hook 只在致命錯誤時回傳 `Err`（驅動會停止）；可恢復的錯誤
 
 合約：
 
-- **`StepArb`**（通用）：`arb(loanToken, loanAmount, steps, sweep, minProfit, deadlineBlock)`。本體執行 `steps`；之後把 `sweep` 裡的每個代幣（中間代幣）送到 `PROFIT_RECEIVER`，所以 exact-input 的捨入或部分成交都不會留在合約裡。轉換（代幣遷移、wrapper）就是一個打到白名單 target 的 kind 0 步驟。constructor：`(morpho, poolManager, owner, executor, profitReceiver)`。
-- **`AeroMigrationArb`**（範例）：`arb(loanToken, loanAmount, buy, sell, minProfit, deadlineBlock)`；本體是買 -> 對全部舊 AERO 呼叫 `Migration.depositLiquid`（一個都沒買到就 revert `NothingBought`）-> 賣，舊／新 AERO 都會清走。同一個套利也能在 StepArb 上執行，把遷移寫成一個步驟（`StepArb.fork.t.sol` 檢查利潤完全相同；在 e2e 路線上 StepArb 多用約 5k gas，約 0.9%）。
+- **`StepArb`**（通用）：`arb(loanToken, loanAmount, steps, sweep, minProfit, deadlineBlock)`。本體執行 `steps`；之後把每個步驟的 `tokenIn`，以及 `sweep` 裡的每個代幣（沒有步驟拿來當輸入的代幣，例如 router 的附帶產出）送到 `PROFIT_RECEIVER`，所以 exact-input 的捨入或部分成交都不會留在合約裡。轉換（代幣遷移、wrapper）就是一個打到白名單 target 的 kind 0 步驟。constructor：`(morpho, poolManager, owner, executor, profitReceiver)`。
+- **`AeroMigrationArb`**（範例）：`arb(loanToken, loanAmount, buy, sell, minProfit, deadlineBlock)`；本體是買 -> 對全部舊 AERO 呼叫 `Migration.depositLiquid`（一個都沒買到就 revert `NothingBought`）-> 賣，舊／新 AERO 和各步驟的輸入代幣都會清走。同一個套利也能在 StepArb 上執行，把遷移寫成一個步驟（`StepArb.fork.t.sol` 檢查利潤完全相同；在 e2e 路線上 StepArb 多用約 5k gas，約 0.9%）。
 
-步驟（`ArbStep`）：kind 0 = 白名單內的 target，給剛好的授權（數量可以寫入 calldata）；kind 1/2 = 白名單 factory 的 Solidly 類池子（`isPool`），產出在鏈上用 `getAmountOut` / `getAmountOutWithTotalFee` 計算；kind 3 = CL 池，它的 factory 在白名單內，且 `getPool` 回傳的正是這個池子，在它自己的 swap callback 裡付款（只付給正在交易的池子、只付一次、最多 `amountIn`）。`amountIn = type(uint256).max` 表示用掉合約持有的全部 `tokenIn`。
+步驟（`ArbStep`）：kind 0 = 白名單內的 target，給剛好的授權（數量可以寫入 calldata）；kind 1/2 = 白名單 factory 的 Solidly 類池子（`isPool`），`tokenIn` 必須是它的兩個代幣之一，產出在鏈上用 `getAmountOut` / `getAmountOutWithTotalFee` 計算；kind 3 = Slipstream / Aero CL 池，它的 factory 在白名單內，且 `getPool(token0, token1, tickSpacing)` 回傳的正是這個池子，在它自己的 swap callback 裡付款（只付給正在交易的池子、只付一次、最多 `amountIn`；`amountIn` 必須放得進 int256，否則 `BadAmount`）。kind 3 不支援 Uniswap V3 / PancakeSwap V3 池（它們的 factory 用 fee 而不是 tick spacing 找池子，PancakeSwap 回呼的是 `pancakeV3SwapCallback`），要用就透過 router（kind 0）。CL swap 在到達價格上限前流動性用完時，只會吃下部分輸入，剩下的會隨步驟的 `tokenIn` 一起清走。`amountIn = type(uint256).max` 表示用掉合約持有的全部 `tokenIn`。
 
 ### 安全模型
 
@@ -59,13 +59,13 @@ hook 只在致命錯誤時回傳 `Err`（驅動會停止）；可恢復的錯誤
 - 資金方沒有回呼就返回的入口會 revert `NotFunded`。
 - **兩份白名單**：target（kind 0，會拿到授權和任意 calldata）放在 `allowedTarget`；池子 factory（kind 1～3，只會被問「這個池子是不是你的」）放在 `allowedFactory`（`setAllowedFactory`）。factory 永遠不能被當成 router 呼叫，router 也不能替池子背書。
 - 授權都是剛好的數量，用完歸零；PoolManager 拿回的剛好是被借出的數量。
-- 還款後剩下的借款代幣餘額低於 `minProfit` 就整筆 revert；利潤和清走的代幣送到 immutable 的 `PROFIT_RECEIVER`；平常不留存任何資金。
+- 還款後剩下的借款代幣餘額低於 `minProfit` 就整筆 revert；利潤和清走的代幣（每個步驟的輸入代幣，加上 sweep 清單或舊／新 AERO）送到 immutable 的 `PROFIT_RECEIVER`；平常不留存任何資金。
 
 ### 測試
 
 - `contracts/test/AeroMigrationArb.funding.t.sol`（不需 RPC）：一個惡意合約同時扮演 Morpho 和 PoolManager，所以保護套利的只有資金標記：跨來源的 callback、第二次 callback、不回呼的資金方都會被擋下；只回呼一次的誠實資金方會成功（對照組）。
 - `contracts/test/AeroMigrationArb.fork.t.sol`（Base fork）：真實的遷移合約和舊池子，兩種資金路徑都測。V4 路徑剛好還清 PoolManager，利潤和 Morpho 路徑完全相同；在測試路線上用了 682k gas，Morpho 是 703k。另外測試最低利潤、白名單、假池子、CL callback 防護、executor／過期／暫停、停用 V4，以及 factory 和 router 是兩份獨立的白名單（`test_factoriesAndRoutersAreSeparateLists`）。固定在某個區塊上跑。
-- `contracts/test/StepArb.security.t.sol`（不需 RPC）：兩種資金來源都會執行步驟、還款並付給接收者；sweep 清單；minProfit；executor／過期／暫停；target 要在白名單內，factory 不是 target；錯誤的 kind 和 patch；callback 只能來自它的資金方、在自己的套利裡、只能一次；不回呼的資金方；停用 V4。
+- `contracts/test/StepArb.security.t.sol`（不需 RPC）：兩種資金來源都會執行步驟、還款並付給接收者；沒有 sweep 清單時步驟的輸入代幣也會清走，清單負責其他代幣；minProfit；executor／過期／暫停；target 要在白名單內，factory 不是 target；錯誤的 kind 和 patch；池子步驟的 `tokenIn` 必須是池子的代幣；CL 部分成交的剩餘會清走；CL 數量超過 int256 會 revert `BadAmount`；callback 只能來自它的資金方、在自己的套利裡、只能一次；不回呼的資金方；停用 V4。
 - `contracts/test/StepArb.fork.t.sol`（Base fork）：寫成步驟的 Aero 遷移套利，在同一條路線上賺的和 AeroMigrationArb 完全相同，兩種資金來源都測；Migration 必須是白名單內的 target。
 - `contracts/test/GridQuoter.fork.t.sol`：只用於模擬的報價合約。
 - `bot/src/aero.rs` 的 `e2e_arb_executor_sends_a_profitable_arb_on_anvil_fork` 和 `e2e_the_same_arb_runs_on_the_generic_step_arb`（ignored；本地 anvil fork）：像 owner 一樣部署合約（AeroMigrationArb／StepArb）並設定白名單，透過真實的舊池子和遷移合約（新 AERO 由固定匯率的替身 router 賣出）走 `exact` / `pick` / `terms` / `send` 和 executor（兩種資金來源都做精確檢查，送出較好的那個），並確認緊急停止檔案的關卡會擋下下一筆。

@@ -75,22 +75,29 @@ the same for both:
 The contracts:
 
 - **`StepArb`** (generic): `arb(loanToken, loanAmount, steps, sweep, minProfit, deadlineBlock)`.
-  The body runs `steps`; afterwards every token in `sweep` (the intermediate tokens) is sent to
-  `PROFIT_RECEIVER`, so exact-input rounding or a partial fill never stays at rest. A conversion
+  The body runs `steps`; afterwards every step's `tokenIn` and every token in `sweep` (one no step
+  takes as input, e.g. a router's side output) is sent to `PROFIT_RECEIVER`, so exact-input
+  rounding or a partial fill never stays at rest. A conversion
   (a token migration, a wrapper) is a kind-0 step on an allowlisted target. Constructor:
   `(morpho, poolManager, owner, executor, profitReceiver)`.
 - **`AeroMigrationArb`** (the example): `arb(loanToken, loanAmount, buy, sell, minProfit,
   deadlineBlock)`; the body is buy -> `Migration.depositLiquid` of all old AERO (reverts
-  `NothingBought` if none) -> sell, and old / new AERO are swept. The same arb runs on StepArb with
+  `NothingBought` if none) -> sell, and old / new AERO and the steps' input tokens are swept. The
+  same arb runs on StepArb with
   the migration as a step (`StepArb.fork.t.sol` checks the profit is identical; StepArb costs
   ~5k more gas on the e2e route, ~0.9%).
 
 Steps (`ArbStep`): kind 0 = allowlisted target with an exact allowance (amount optionally
 patched into the calldata); kinds 1/2 = Solidly-style pool of an allowlisted factory (`isPool`),
-output computed on-chain with `getAmountOut` / `getAmountOutWithTotalFee`; kind 3 = CL pool whose
-factory is allowlisted and returns this exact pool from `getPool`, paid inside its own swap
-callback (only the active pool, once, at most `amountIn`). `amountIn = type(uint256).max` spends
-the contract's whole balance of `tokenIn`.
+`tokenIn` one of its two tokens, output computed on-chain with `getAmountOut` /
+`getAmountOutWithTotalFee`; kind 3 = Slipstream / Aero CL pool whose factory is allowlisted and
+returns this exact pool from `getPool(token0, token1, tickSpacing)`, paid inside its own swap
+callback (only the active pool, once, at most `amountIn`, which must fit an int256: `BadAmount`).
+Uniswap V3 / PancakeSwap V3 pools are not supported by kind 3 (their factories key pools by fee,
+and PancakeSwap calls back `pancakeV3SwapCallback`); reach them through a router (kind 0). A CL
+swap that runs out of liquidity before the price limit takes less than its input; the rest is
+swept with the step's `tokenIn`. `amountIn = type(uint256).max` spends the contract's whole
+balance of `tokenIn`.
 
 ### Security model
 
@@ -107,7 +114,8 @@ the contract's whole balance of `tokenIn`.
   cannot vouch for pools.
 - Allowances are exact and reset to zero; the PoolManager is paid exactly what was taken.
 - The tx reverts unless the loan-token balance left after repayment is at least `minProfit`;
-  profit and the swept tokens go to the immutable `PROFIT_RECEIVER`; nothing is held at rest.
+  profit and the swept tokens (every step's input token, plus the sweep list or old / new AERO)
+  go to the immutable `PROFIT_RECEIVER`; nothing is held at rest.
 
 ### Tests
 
@@ -120,9 +128,11 @@ the contract's whole balance of `tokenIn`.
   fake pools, CL callback guard, executor / expiry / pause, disabled V4, factories and routers as
   separate lists (`test_factoriesAndRoutersAreSeparateLists`). Pinned to a fixed block.
 - `contracts/test/StepArb.security.t.sol` (no RPC): both funding sources run the steps, repay and
-  pay the receiver; the sweep list; minProfit; executor / expiry / pause; targets allowlisted and
-  factories not targets; bad kinds and patches; callbacks only from their funder inside our own
-  arb, once; silent funder; disabled V4.
+  pay the receiver; step input tokens swept without a sweep list, and the list for the rest;
+  minProfit; executor / expiry / pause; targets allowlisted and factories not targets; bad kinds
+  and patches; a pool step's `tokenIn` must be a pool token; a CL partial fill is swept; a CL
+  amount past int256 reverts `BadAmount`; callbacks only from their funder inside our own arb,
+  once; silent funder; disabled V4.
 - `contracts/test/StepArb.fork.t.sol` (Base fork): the Aero migration arb written as steps earns
   exactly what AeroMigrationArb earns on the same route, with both funding sources; the Migration
   must be an allowlisted target.
