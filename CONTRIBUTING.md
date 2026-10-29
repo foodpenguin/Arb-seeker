@@ -23,6 +23,7 @@ optionally an RPC endpoint for fork tests (a public one is used by default).
 
 ```
 cd bot && cargo check --all-targets     # 0 warnings
+cd bot && cargo clippy --all-targets     # 0 warnings
 cd bot && cargo test
 cd contracts && forge build && forge test -j 1   # fork tests: public endpoint by default, BASE_RPC_URL overrides
 ```

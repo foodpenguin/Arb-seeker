@@ -21,6 +21,7 @@
 
 ```
 cd bot && cargo check --all-targets     # 0 warnings
+cd bot && cargo clippy --all-targets     # 0 warnings
 cd bot && cargo test
 cd contracts && forge build && forge test -j 1   # fork 測試預設用公共端點，BASE_RPC_URL 可覆寫
 ```

@@ -20,7 +20,7 @@ core code.
 - `docs/` — architecture and setup, in English and Traditional Chinese (`*.zh-TW.md`).
 
 ## Commands
-- `cd bot && cargo check --all-targets` must stay at **0 warnings**; `cargo test` must pass.
+- `cd bot && cargo check --all-targets` and `cargo clippy --all-targets` must stay at **0 warnings**; `cargo test` must pass.
 - `cargo test e2e -- --ignored` runs the send path on a local **anvil fork**, for both contracts.
 - `cd contracts && forge build`; `forge test --no-match-contract Fork` runs the security suites
   without RPC; fork tests use a public endpoint by default (`BASE_RPC_URL` overrides; `-j 1` on

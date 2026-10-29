@@ -297,12 +297,12 @@ impl SameBlock {
             if let Some(to) = to {
                 self.recent_to.insert(keccak256(raw), (to, fb.block, hit, tx.input().len() as u32));
             }
-            if hit {
-                if let Ok(from) = tx.recover_signer() {
-                    let mut req = TransactionRequest::from_transaction_with_sender(tx, from);
-                    req.nonce = None; // the node takes the sender's nonce as it stands in the replay
-                    fresh.push(req);
-                }
+            if hit
+                && let Ok(from) = tx.recover_signer()
+            {
+                let mut req = TransactionRequest::from_transaction_with_sender(tx, from);
+                req.nonce = None; // the node takes the sender's nonce as it stands in the replay
+                fresh.push(req);
             }
         }
         let Some(pd) = self.pending.as_mut().filter(|pd| pd.block == fb.block) else { return };
@@ -637,7 +637,7 @@ impl<P: Provider + Clone> OpportunitySource<P> for Aero<'_> {
         if let Outcome::Included { success: false, gas_used, effective_gas_price, l1_fee_wei, .. } = outcome {
             let eth_usd = self.state.eth_usd(&self.cfg.aero, self.cfg.exec.eth_usd_fallback);
             let usd = (*gas_used as f64 * *effective_gas_price as f64 + *l1_fee_wei as f64) / 1e18 * eth_usd;
-            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+            let now = crate::gates::unix_secs();
             self.state.budget.charge(now, usd);
         }
         info!(tx = %inf.hash, ?outcome, "aero: outcome");
@@ -1190,7 +1190,7 @@ async fn quote<P: Provider>(cfg: &Config, p: &P, paths: &[Path], loans: &[Vec<U2
             if feed.is_none() && pool.is_none() {
                 return Some(1.0);
             }
-            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+            let now = crate::gates::unix_secs();
             let from_feed = feed.and_then(|i| r[i].as_ref()).and_then(|b| IUsdFeed::latestRoundDataCall::abi_decode_returns(b).ok()).and_then(|d| {
                 let age = now.saturating_sub(d.updatedAt.saturating_to::<u64>());
                 if age > a.usd_feed_max_age_secs {
@@ -1353,10 +1353,10 @@ async fn tick<P: Provider + Clone>(
                         "state": state_label, "fb": at.fb(), "ahead": ahead, "fresh_share": state.pending_hits as f64 / state.quotes.max(1) as f64 })
             )?;
         }
-        if let Some((pl, e)) = lq {
-            if best.as_ref().is_none_or(|(_, _, b)| e > *b) {
-                best = Some((li, pl, e));
-            }
+        if let Some((pl, e)) = lq
+            && best.as_ref().is_none_or(|(_, _, b)| e > *b)
+        {
+            best = Some((li, pl, e));
         }
     }
     let Some((li, best_plan, est)) = best else { return Ok(()) };
@@ -1447,7 +1447,7 @@ async fn tick<P: Provider + Clone>(
     }
     // The node wants gas_limit x maxFee up front, which a bid raises: the executor's background
     // balance reading, minus what is in flight.
-    let Some(balance) = e.spendable().map(|b| math::u256_f64(b)) else {
+    let Some(balance) = e.spendable().map(math::u256_f64) else {
         warn!("aero: no hot-wallet balance reading yet; not sending");
         return Ok(());
     };
