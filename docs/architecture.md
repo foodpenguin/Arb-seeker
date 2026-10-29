@@ -35,7 +35,9 @@ owns the scheduling:
 - the executor (live mode) runs as its own task (`onchain_core::actor`): the driver announces each
   head to it, it polls the receipt of the tx in flight, and a settled tx reaches `on_outcome` (with
   gas accounting and whether it started the failure cooldown) through the driver loop; then
-  `on_block` per head. A strategy sends through the `ExecHandle` it is handed;
+  `on_block` per head, after waiting briefly (`wait_polled`, at most `RECEIPT_WAIT`) for that
+  head's receipt poll and delivering what it settled to `on_outcome`, so a tx included in it no
+  longer counts as in flight and its books (e.g. the budget reservation) are settled first. A strategy sends through the `ExecHandle` it is handed;
 - flashblocks batches (the first one plus whatever queued behind it) -> `on_flashblocks`, when the
   strategy runs a same-block mode.
 
@@ -159,13 +161,15 @@ head or a replayed in-progress block) and how to value the profit token in USD.
 5. `send(executor, candidate, terms, gates, block, deadline)`: the gates every strategy shares, then
    the executor. `Gates { kill_switch_file, budget, daily_cap_usd, now_unix }`: a kill-switch file,
    the executor's failure cooldown, and a daily budget that the candidate's worst case if it reverts
-   (gas at its priority + L1 fee) must fit in; any of them = `Ok(None)`, nothing sent.
+   (gas at its priority + L1 fee) must fit in, reserved there while the tx is in flight (release it
+   with `DailyBudget::release(inflight.key)` in `on_outcome`); any of them = `Ok(None)`, nothing
+   sent.
 
 Logs from this module read `arb: ...` with a `strategy` field. It re-exports what every strategy's
 send path needs from `onchain_core::gates`: `deadline_blocks(deadline_secs, block_time)` (a
 deadline in seconds as blocks at the observed block time, so a 2 s -> 200 ms change needs no config
 edit), `DailyBudget` (gas burned by reverted txs per UTC day: `charge` after a revert, `allows`
-before a send), `gas_cost_usd` and `l1_fee_wei`.
+before a send, `reserve` / `release` around a tx in flight), `gas_cost_usd` and `l1_fee_wei`.
 
 ### Writing a trade for `StepArb` (`bot/src/step_arb.rs`)
 
@@ -202,7 +206,7 @@ Aerodrome V2 and Slipstream pools) -> migrate -> sell new AERO (split over Aero 
   converted with the block time measured from the heads.
 - **Daily gas budget:** a send whose worst-case cost if it reverts (L2 gas at its priority + L1
   fee) would take today's spend on reverted arbs past `[exec] daily_gas_budget_usd` is skipped;
-  `on_outcome` charges each reverted arb's real cost.
+  `on_outcome` releases the reservation and charges each reverted arb's real cost.
 - **USD prices:** a loan token that is not a USD stablecoin is priced in the same multicall, by a
   Chainlink feed (`usd_feed`, 8 decimals, `latestRoundData`) when set and fresh (updated within
   `[aero] usd_feed_max_age_secs`, default 3600), else by a pool quote (`usd_pool`, `getAmountOut`);

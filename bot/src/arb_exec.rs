@@ -189,14 +189,28 @@ impl ArbExecutor {
     /// Sends `c` on these terms through `e`, after the gates every strategy must pass (enforced
     /// here, not left to each strategy): the kill-switch file, the executor's failure cooldown, and
     /// the daily budget for gas burned by reverts (what this tx would burn if it reverted: L2 gas
-    /// at its priority plus the L1 fee). None = not sent (logged).
+    /// at its priority plus the L1 fee, reserved in the budget while the tx is in flight: the
+    /// strategy releases it in `on_outcome`). None = not sent (logged).
     pub async fn send(&self, e: &ExecHandle, c: &Candidate, t: &SendTerms, mut gates: Gates<'_>, block: u64, deadline_block: u64) -> Result<Option<Inflight>> {
         let worst_usd = gas_cost_usd(c.gas_est, self.base_fee_wei, t.priority_fee_wei, self.eth_usd) + c.l1_usd;
-        if let Err(why) = gates.check(e.halted(), worst_usd) {
+        let req = self.request(c, t, block, deadline_block);
+        if let Err(why) = gates.reserve(req.key, e.halted(), worst_usd) {
             info!(strategy = self.name, reason = %why, "arb: not sending");
             return Ok(None);
         }
-        Ok(Some(e.send(self.request(c, t, block, deadline_block)).await?))
+        match e.send(req).await {
+            Ok(inf) => Ok(Some(inf)),
+            Err(err) => {
+                gates.budget.release(self.key());
+                Err(err)
+            }
+        }
+    }
+
+    /// The executor key of this strategy's arbs: one per contract, so a strategy never has two
+    /// arbs through it in flight.
+    pub fn key(&self) -> TxKey {
+        TxKey::of_address(0, self.contract)
     }
 
     /// The executor's send request for `c` on these terms.
@@ -207,8 +221,8 @@ impl ArbExecutor {
             gas_limit: t.gas_limit,
             base_fee_wei: self.base_fee_wei,
             priority_fee_wei: t.priority_fee_wei,
-            // One key per contract: a strategy never has two arbs through it in flight.
-            key: TxKey::of_address(0, self.contract),
+            key: self.key(),
+            exclusive_group: false,
             block,
             deadline_block,
         }

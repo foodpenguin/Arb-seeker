@@ -631,7 +631,9 @@ impl<P: Provider + Clone> OpportunitySource<P> for Aero<'_> {
         if cooldown_started {
             writeln!(self.journal, "{}", json!({ "kind": "aero_cooldown", "block": block, "secs": self.cfg.exec.failure_cooldown_secs }))?;
         }
-        // A revert burned gas for nothing: it counts against the daily budget.
+        // Settled: its worst-case reservation goes; a revert burned gas for nothing and counts
+        // against the daily budget.
+        self.state.budget.release(inf.key);
         if let Outcome::Included { success: false, gas_used, effective_gas_price, l1_fee_wei, .. } = outcome {
             let eth_usd = self.state.eth_usd(&self.cfg.aero, self.cfg.exec.eth_usd_fallback);
             let usd = (*gas_used as f64 * *effective_gas_price as f64 + *l1_fee_wei as f64) / 1e18 * eth_usd;
@@ -811,12 +813,12 @@ impl Funder {
 
     /// Calldata for this source's entry point of the configured contract. Every entry point (both
     /// contracts, both sources) has minProfit at the same offset (`ARB_MIN_PROFIT`) and returns the
-    /// profit as one uint256. On StepArb the migration is a step between buy and sell
+    /// profit as one uint256. On StepArb (`contract`) the migration is a step between buy and sell
     /// (depositLiquid of the whole old-AERO balance to the contract), and old / new AERO are swept.
-    fn encode(&self, a: &AeroConfig, loan_token: Address, amount: U256, buy: Vec<ArbStep>, sell: Vec<ArbStep>, deadline: u64) -> Bytes {
+    #[allow(clippy::too_many_arguments)]
+    fn encode(&self, a: &AeroConfig, contract: Address, loan_token: Address, amount: U256, buy: Vec<ArbStep>, sell: Vec<ArbStep>, deadline: u64) -> Bytes {
         if a.contract_kind == AeroContract::Steps {
-            let recipient = a.contract.unwrap_or_default();
-            let migrate: Bytes = IAeroMigration::depositLiquidCall { amount: U256::ZERO, recipient }.abi_encode().into();
+            let migrate: Bytes = IAeroMigration::depositLiquidCall { amount: U256::ZERO, recipient: contract }.abi_encode().into();
             let steps = buy.into_iter().chain([step_arb::call_step(a.migration, a.old_token, U256::MAX, migrate, 4)]).chain(sell).collect();
             return step_arb::calldata(self.funding(), loan_token, amount, steps, vec![a.old_token, a.new_token], deadline);
         }
@@ -1399,7 +1401,7 @@ async fn tick<P: Provider + Clone>(
         for f in &funders {
             built.push((pi, f, amt));
             cands.push(Candidate {
-                calldata: f.encode(a, l.token, amt, buy.clone(), sell.clone(), deadline),
+                calldata: f.encode(a, contract, l.token, amt, buy.clone(), sell.clone(), deadline),
                 // Each source at its own gas: with equal profit (both 0 fee) V4 wins on its gas
                 // saving, Morpho wherever V4 cannot fund the size.
                 gas_est: arb_gas(a, pl.buy.len() + pl.sell.len(), f),
@@ -1546,7 +1548,7 @@ mod tests {
         let fs = Funder::enabled(&a);
         assert_eq!(fs.iter().map(|f| (f.name(), f.holder())).collect::<Vec<_>>(), vec![("morpho", flash::BASE_MORPHO), ("v4", pm)], "Morpho first: it wins ties");
         let step = ArbStep { kind: U256::from(1u8), target: POOL, tokenIn: Address::repeat_byte(9), amountIn: U256::MAX, patchOffset: U256::ZERO, data: Bytes::new() };
-        let enc = |f: &Funder| f.encode(&AeroConfig::default(), Address::repeat_byte(9), U256::from(5u8), vec![step.clone()], vec![step.clone()], 77);
+        let enc = |f: &Funder| f.encode(&AeroConfig::default(), Address::ZERO, Address::repeat_byte(9), U256::from(5u8), vec![step.clone()], vec![step.clone()], 77);
         let (m, v) = (enc(&fs[0]), enc(&fs[1]));
         assert_eq!((&m[..4], &v[..4]), (&IAeroArb::arbCall::SELECTOR[..], &IAeroArb::arbFlashAccountingCall::SELECTOR[..]));
         assert_eq!(m[4..], v[4..], "same arguments");
@@ -1792,7 +1794,7 @@ mod e2e {
         let funders = Funder::enabled(&funding);
         let cands: Vec<Candidate> = funders
             .iter()
-            .map(|f| Candidate { calldata: f.encode(&funding, USDC, loan, buy.clone(), sell.clone(), n + 20), gas_est: arb_gas(a, 2, f), floor_usd: 1.0, l1_usd: 0.0 })
+            .map(|f| Candidate { calldata: f.encode(&funding, arb, USDC, loan, buy.clone(), sell.clone(), n + 20), gas_est: arb_gas(a, 2, f), floor_usd: 1.0, l1_usd: 0.0 })
             .collect();
         let ae = ArbExecutor {
             name: "aero-e2e",

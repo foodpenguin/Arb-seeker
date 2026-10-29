@@ -22,7 +22,7 @@ pub trait OpportunitySource<P> {
 `runner::run(&mut strategy, provider, executor, heads, flashblocks, RunnerOpts { poll_ms, ws_quiet })` 負責排程：
 
 - 新區塊來自 WebSocket `newHeads`（多個端點），去重並保證嚴格遞增；WS 安靜超過 `ws_quiet` 時，每 `poll_ms` 用 HTTP 輪詢；
-- executor（實跑模式）作為獨立的 task 執行（`onchain_core::actor`）：驅動把每個新區塊公告給它，它輪詢在飛交易的 receipt，已結算的交易經由驅動迴圈送到 `on_outcome`（含 gas 計算，以及它是否觸發了失敗冷卻）；接著每個新區塊呼叫 `on_block`。策略透過交給它的 `ExecHandle` 送單；
+- executor（實跑模式）作為獨立的 task 執行（`onchain_core::actor`）：驅動把每個新區塊公告給它，它輪詢在飛交易的 receipt，已結算的交易經由驅動迴圈送到 `on_outcome`（含 gas 計算，以及它是否觸發了失敗冷卻）；接著每個新區塊呼叫 `on_block`，呼叫前會短暫等該區塊的 receipt 查完（`wait_polled`，最多 `RECEIPT_WAIT`），並先把結算結果交給 `on_outcome`，讓這個區塊剛上鏈的交易不再算在飛、它的帳（例如預算預留）也先結清。策略透過交給它的 `ExecHandle` 送單；
 - 策略有同塊模式時，flashblocks 批次（第一個加上排在後面的）-> `on_flashblocks`。
 
 hook 只在致命錯誤時回傳 `Err`（驅動會停止）；可恢復的錯誤由策略自己記 log 並吞掉。觀察模式下 `exec` 是 `None`。
@@ -78,9 +78,9 @@ hook 只在致命錯誤時回傳 `Err`（驅動會停止）；可恢復的錯誤
 2. `pick(candidates, exact, usd)` -> `Picked { index, profit, gross_usd, net_usd }`：淨利 = 利潤減掉該候選的模型 gas（`gas_cost_usd`），再減掉它的 L1 data fee（`l1_usd`，由策略用 `l1_fee_wei` 填入，也就是 GasPriceOracle 依 calldata 大小給出的上限）；先選達到門檻的，再選淨利高的；完全平手時保留較前面的候選。
 3. `terms(candidate, picked, balance, usd, call)` -> `SendTerms { priority_fee_wei, gas_limit, min_profit, bid_usd }`：`BidPolicy::priority` 可以拿大額利潤的一部分出價（不超過淨利減門檻，並受 `max_priority_wei` 限制）；出價會搭配較緊的 gas limit（模型的 2 倍），並在它自己的 priority 下重新檢查，在那裡過不了門檻就改回基本出價；錢包必須付得起 gas limit × max fee（否則回傳 None）；`min_profit` = 精確利潤 × `min_profit_keep`。
 4. `request(candidate, terms, block, deadline)` -> executor 的 `SendRequest`（minProfit 會寫進合約的 `min_profit_slot`）。
-5. `send(executor, candidate, terms, gates, block, deadline)`：先過所有策略共用的關卡，再交給 executor。`Gates { kill_switch_file, budget, daily_cap_usd, now_unix }`：緊急停止檔案、executor 的失敗冷卻，以及每日預算（候選交易萬一 revert 的最壞成本，也就是它 priority 下的 gas 加 L1 fee，必須放得進去）；任何一關擋下就回傳 `Ok(None)`，什麼都不送。
+5. `send(executor, candidate, terms, gates, block, deadline)`：先過所有策略共用的關卡，再交給 executor。`Gates { kill_switch_file, budget, daily_cap_usd, now_unix }`：緊急停止檔案、executor 的失敗冷卻，以及每日預算（候選交易萬一 revert 的最壞成本，也就是它 priority 下的 gas 加 L1 fee，必須放得進去，交易在飛期間預留在預算裡，在 `on_outcome` 用 `DailyBudget::release(inflight.key)` 釋放）；任何一關擋下就回傳 `Ok(None)`，什麼都不送。
 
-這個模組的 log 以 `arb: ...` 開頭，並帶有 `strategy` 欄位。它從 `onchain_core::gates` 重新匯出每個策略送單時都需要的東西：`deadline_blocks(deadline_secs, block_time)`（把以秒計的期限依實測出塊時間換算成區塊數，出塊時間從 2 秒變 200 ms 也不必改設定）、`DailyBudget`（每個 UTC 日 revert 交易燒掉的 gas：revert 後 `charge`，送出前 `allows`）、`gas_cost_usd` 和 `l1_fee_wei`。
+這個模組的 log 以 `arb: ...` 開頭，並帶有 `strategy` 欄位。它從 `onchain_core::gates` 重新匯出每個策略送單時都需要的東西：`deadline_blocks(deadline_secs, block_time)`（把以秒計的期限依實測出塊時間換算成區塊數，出塊時間從 2 秒變 200 ms 也不必改設定）、`DailyBudget`（每個 UTC 日 revert 交易燒掉的 gas：revert 後 `charge`，送出前 `allows`，交易在飛期間 `reserve` / `release`）、`gas_cost_usd` 和 `l1_fee_wei`。
 
 ### 為 `StepArb` 寫交易（`bot/src/step_arb.rs`）
 
@@ -94,7 +94,7 @@ hook 只在致命錯誤時回傳 `Err`（驅動會停止）；可恢復的錯誤
 - **報價**（每個區塊，固定在 head 的區塊高度上，所以每次讀取看到的是同一個狀態）：一次 multicall 取得 USD 價格和 V2 報價；CL 池用 state override 注入的 `GridQuoter` 報價。買方曲線依一組借款金額報價，賣方曲線依一組 AERO 數量報價。
 - **規劃**：每個借款金額把輸入 greedy 分配到各買方池（對凹曲線是最佳解），買到的舊 AERO 同樣分配到各賣方池；淨利最高的金額勝出。估算會扣掉已啟用來源中最便宜的閃電手續費和模型 gas。
 - **精確檢查和送單**都透過 `ArbExecutor`：每個金額（最佳金額和它的鄰近金額，各自重新分配）× 每個啟用的資金來源各一個 `Candidate`，Morpho 排在前面，所以完全平手時選它；每個候選有自己的模型 gas（`arb_gas`）和依借款金額的門檻。`call` 在封裝好的區塊上執行，同塊模式下則在重播過的進行中區塊上執行。L1 data fee（和精確檢查一起讀一次，以最大的 calldata 為準）計入每個候選的淨利。只有精確檢查的結果會被送出，`minProfit = 精確利潤 × min_profit_keep`，期限是 `[aero] deadline_secs` 依區塊頭實測的出塊時間換算。
-- **每日 gas 預算**：一筆交易若 revert 時的最壞成本（以它的 priority 計的 L2 gas + L1 fee）會讓今天 revert 套利的花費超過 `[exec] daily_gas_budget_usd`，就不送；`on_outcome` 會把每筆 revert 套利的實際成本記上。
+- **每日 gas 預算**：一筆交易若 revert 時的最壞成本（以它的 priority 計的 L2 gas + L1 fee）會讓今天 revert 套利的花費超過 `[exec] daily_gas_budget_usd`，就不送；`on_outcome` 會釋放預留，並把每筆 revert 套利的實際成本記上。
 - **USD 價格**：不是 USD 穩定幣的借款代幣會在同一個 multicall 裡計價：有設定 Chainlink feed（`usd_feed`，8 位小數，`latestRoundData`）而且夠新（在 `[aero] usd_feed_max_age_secs` 內更新過，預設 3600）就用 feed，否則用池子報價（`usd_pool`，`getAmountOut`）；優先用 feed，因為池子可能被抽乾或被推動。範例用 Base 的 ETH/USD feed 為 WETH 計價。第一個有計價的代幣也提供 `eth_usd`。
 - **合約**（`[aero] contract_kind`）：`"migration"`（預設）= AeroMigrationArb，內建遷移；`"steps"` = StepArb，遷移寫成買和賣之間的一個 kind 0 步驟（`depositLiquid(all old AERO, contract)`），舊／新 AERO 都會清走；這時 pre-flight 改成檢查 Migration 是白名單內的 target，而不是讀 `MIGRATION()`。
 - **資金**（`[aero] funding`）：`"morpho"`（預設）呼叫 `arb`；`"v4"` 呼叫 `arbFlashAccounting`；`"auto"` 每個金額都同時用兩個入口精確檢查（eth_call 變兩倍），依各來源自己的模型 gas 扣除後送出淨利較高的。只要設定了 `[aero] contract`（觀察模式也一樣），bot 就會檢查合約的 `MORPHO()` / `POOL_MANAGER()` 和設定一致，不一致就拒絕啟動。實跑的 pre-flight 也會拒絕 `PROFIT_RECEIVER` 是熱錢包的合約。

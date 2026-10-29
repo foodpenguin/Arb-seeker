@@ -109,13 +109,7 @@ pub async fn run<P: Provider + Clone + Send + Sync + 'static, S: OpportunitySour
                 }
             }
             Some(s) = next_settled(&mut settled) => {
-                let Settled { inflight, outcome, cooldown_started } = s;
-                if let Outcome::Included { gas_used, effective_gas_price, l1_fee_wei, .. } = &outcome {
-                    gas_spent_wei += U256::from(*gas_used) * U256::from(*effective_gas_price) + U256::from(*l1_fee_wei);
-                }
-                // Lost races / expiries are normal; a burst pauses sending for a while
-                // (executor::FailurePolicy), then it resumes by itself.
-                strategy.on_outcome(last_block, &inflight, &outcome, gas_spent_wei, cooldown_started)?;
+                deliver(strategy, s, last_block, &mut gas_spent_wei)?;
                 continue;
             }
             Some(first) = next_fb(&mut fb) => {
@@ -128,12 +122,33 @@ pub async fn run<P: Provider + Clone + Send + Sync + 'static, S: OpportunitySour
             continue;
         }
         last_block = head.number;
-        // The executor task polls its receipts on this head.
+        // The executor task polls its receipts on this head; the strategy waits for that (briefly),
+        // so a tx included in it no longer counts as in flight when it decides whether to send,
+        // and gets its outcome first (`on_outcome` settles the strategy's own books, e.g. the
+        // budget reservation, before `on_block` may send the next one).
         blocks_tx.send_replace(head.number);
+        if let Some(e) = exec.as_ref() {
+            e.wait_polled(head.number, actor::RECEIPT_WAIT).await;
+        }
+        if let Some(rx) = settled.as_mut() {
+            while let Ok(s) = rx.try_recv() {
+                deliver(strategy, s, last_block, &mut gas_spent_wei)?;
+            }
+        }
         strategy.on_block(&p, &head, exec.as_ref()).await?;
         // A long pass must not read as quiet WS heads.
         quiet_at = quiet_at.max(tokio::time::Instant::now() + opts.ws_quiet);
     }
+}
+
+/// A settled tx to the strategy, with the gas spent so far. Lost races / expiries are normal; a
+/// burst pauses sending for a while (executor::FailurePolicy), then it resumes by itself.
+fn deliver<P: Provider + Clone, S: OpportunitySource<P>>(strategy: &mut S, s: Settled, block: u64, gas_spent_wei: &mut U256) -> Result<()> {
+    let Settled { inflight, outcome, cooldown_started } = s;
+    if let Outcome::Included { gas_used, effective_gas_price, l1_fee_wei, .. } = &outcome {
+        *gas_spent_wei += U256::from(*gas_used) * U256::from(*effective_gas_price) + U256::from(*l1_fee_wei);
+    }
+    strategy.on_outcome(block, &inflight, &outcome, *gas_spent_wei, cooldown_started)
 }
 
 async fn next_settled(rx: &mut Option<mpsc::UnboundedReceiver<Settled>>) -> Option<Settled> {
