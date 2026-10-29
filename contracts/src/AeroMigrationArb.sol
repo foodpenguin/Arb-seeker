@@ -15,7 +15,8 @@ interface IAeroMigration {
 /// @dev Funding, steps and the security model are FlashArbBase's. Two entry points with the same
 ///      arguments (so the same minProfit calldata offset) pick the funding: `arb` (Morpho Blue
 ///      flash loan) and `arbFlashAccounting` (Uniswap V4). The migration is built in between the
-///      buy and sell steps; leftover old / new AERO goes to PROFIT_RECEIVER. The same arb also runs
+///      buy and sell steps; leftover old / new AERO and the steps' input tokens go to
+///      PROFIT_RECEIVER. The same arb also runs
 ///      on the generic StepArb, with the migration as a kind-0 step.
 contract AeroMigrationArb is FlashArbBase {
     IAeroMigration public immutable MIGRATION;
@@ -58,7 +59,7 @@ contract AeroMigrationArb is FlashArbBase {
         uint256 deadlineBlock
     ) external returns (uint256 profit) {
         _flash(FUND_MORPHO, loanToken, loanAmount, abi.encode(buy, sell), deadlineBlock);
-        profit = _done(loanToken, loanAmount, minProfit);
+        profit = _done(loanToken, loanAmount, buy, sell, minProfit);
     }
 
     /// @notice Same as `arb`, funded by Uniswap V4 flash accounting (take from the PoolManager,
@@ -72,12 +73,17 @@ contract AeroMigrationArb is FlashArbBase {
         uint256 deadlineBlock
     ) external returns (uint256 profit) {
         _flash(FUND_V4, loanToken, loanAmount, abi.encode(buy, sell), deadlineBlock);
-        profit = _done(loanToken, loanAmount, minProfit);
+        profit = _done(loanToken, loanAmount, buy, sell, minProfit);
     }
 
-    function _done(address loanToken, uint256 loanAmount, uint256 minProfit) private returns (uint256 profit) {
+    function _done(address loanToken, uint256 loanAmount, ArbStep[] calldata buy, ArbStep[] calldata sell, uint256 minProfit)
+        private
+        returns (uint256 profit)
+    {
         profit = _finish(loanToken, minProfit);
-        // Dust the steps did not spend (exact-input routers, rounding).
+        // Dust the steps did not spend (exact-input routers, rounding, partial fills).
+        _sweepInputs(buy);
+        _sweepInputs(sell);
         _sweep(OLD_TOKEN);
         _sweep(NEW_TOKEN);
         emit Arb(loanToken, loanAmount, migratedInFlight, profit);
