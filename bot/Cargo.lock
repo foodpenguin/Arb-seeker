@@ -3225,6 +3225,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 [[package]]
 name = "onchain-core"
 version = "0.1.0"
+source = "git+https://github.com/foodpenguin/bot-onchain-core?tag=v0.1.0#56f525d500dcc7b413d4c77902d146b3761027a3"
 dependencies = [
  "alloy",
  "anyhow",

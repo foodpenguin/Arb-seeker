@@ -1,4 +1,4 @@
-# arbitrage-framework — notes for AI coding assistants and contributors
+# Arb-seeker (crate `arbitrage-framework`) — notes for AI coding assistants and contributors
 
 A framework for building atomic on-chain **arbitrage bots** in Rust (alloy) + Foundry. The core
 (strategy driver, executor, RPC pool, flashblocks stream, funding sources) is strategy-agnostic;
@@ -11,9 +11,11 @@ core code.
   `FlashAccounting`). Shared: `arb_exec.rs` (`ArbExecutor`: exact check, pick, bid, send terms,
   gates), `step_arb.rs` (the generic StepArb contract), `contracts.rs` (ABIs). Example strategy:
   `aero.rs`.
-- `../onchain-core` — the plumbing (rpc, heads, Flashblocks stream, executor + its task, gates,
-  simulation, shared config sections), a separate repository checked out next to this one and
-  used by path. Changes there must keep this crate and `liquidation-framework` building and passing.
+- `onchain-core` (repository bot-onchain-core) — the plumbing (rpc, heads, Flashblocks stream,
+  executor + its task, gates, simulation, shared config sections), a git dependency pinned to a tag
+  in `bot/Cargo.toml`. Build against a local checkout with
+  `--config 'patch."https://github.com/foodpenguin/bot-onchain-core".onchain-core.path="<path>"'`.
+  Changes there must keep this crate and Debt-keeper building and passing.
 - `contracts/` — Foundry. `FlashArbBase.sol` (funding, steps, security model, admin),
   `StepArb.sol` (generic: any trade as steps), `AeroMigrationArb.sol` (the Aero body), and the
   simulation-only `sim/GridQuoter.sol`.

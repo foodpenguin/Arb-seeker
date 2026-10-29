@@ -1,4 +1,4 @@
-# arbitrage-framework
+# Arb-seeker
 
 [English](README.md)
 
@@ -6,8 +6,9 @@
 開發原子性鏈上**套利 bot** 的框架。區塊／flashblock 迴圈、RPC 池、送單，以及暫時性資金的選擇都是
 通用的；策略透過 trait 接上，而任何能寫成一串步驟的交易，都能在同一個通用合約（`StepArb.sol`）上
 執行。範例策略是 **Base 上的 Aero 合併套利**（舊 AERO 可以 1:1 換成新 AERO：在同一筆交易裡買舊的、
-遷移、賣新的、還款，不需要自有資金）。鏈的基礎管線來自 `onchain-core`，和 `liquidation-framework`
-共用。
+遷移、賣新的、還款，不需要自有資金）。鏈的基礎管線來自
+[bot-onchain-core](https://github.com/foodpenguin/bot-onchain-core)（crate `onchain-core`），和
+[Debt-keeper](https://github.com/foodpenguin/Debt-keeper) 共用。這個 crate 名稱是 `arbitrage-framework`。
 
 > **狀態：**實驗性。這裡沒有任何投資建議，也沒有替你調好的參數：範例設定用的是中性值。請先用
 > 觀察模式跑、在 anvil fork 上測試送單，並有學習期間會虧 gas 的心理準備。
@@ -63,8 +64,14 @@ docs/            架構與安裝（English / 繁體中文）
 
 ## 編譯
 
-這個 crate 以路徑依賴 `onchain-core`：請把兩個 repo 並排 checkout
-（`<dir>/onchain-core`、`<dir>/arbitrage-framework`）。
+`onchain-core` 是鎖定 tag 的 git 依賴（`bot/Cargo.toml`），cargo 會自己抓，不必手動 checkout。要改用
+本機 checkout 的 bot-onchain-core 編譯（例如兩邊同時在改），在 `bot/` 目錄覆寫依賴：
+
+```
+cargo test --config 'patch."https://github.com/foodpenguin/bot-onchain-core".onchain-core.path="../../bot-onchain-core"'
+```
+
+覆寫會改動 `bot/Cargo.lock`，這個變更不要 commit。
 
 ## 快速開始
 

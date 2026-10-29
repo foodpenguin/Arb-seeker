@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "Atomic on-chain arbitrage framework: strategy driver, flash-loan and flash-accounting funding, Aero merger arbitrage on Base as the example"
 license = "AGPL-3.0-or-later"
+repository = "https://github.com/foodpenguin/Arb-seeker"
 publish = false
 
 [lib]
@@ -15,7 +16,7 @@ name = "arb-bot"
 path = "src/main.rs"
 
 [dependencies]
-onchain-core = { path = "../../onchain-core" }
+onchain-core = { git = "https://github.com/foodpenguin/bot-onchain-core", tag = "v0.1.0" }
 alloy = { version = "2.5.0", features = ["full", "json-rpc", "signer-local", "signer-keystore", "node-bindings"] }
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }

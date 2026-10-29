@@ -16,12 +16,11 @@ curl -L https://foundry.paradigm.xyz | bash && ~/.foundry/bin/foundryup  # forge
 
 ## 2. Code
 
-The bot builds on the `onchain-core` crate (by path), so clone both side by side:
+The bot builds on the `onchain-core` crate, a git dependency cargo fetches by itself:
 
 ```bash
-git clone <onchain-core-url> onchain-core
-git clone --recurse-submodules <repo-url> arbitrage-framework
-cd arbitrage-framework
+git clone --recurse-submodules https://github.com/foodpenguin/Arb-seeker.git
+cd Arb-seeker
 git submodule update --init --recursive    # if you cloned without --recurse-submodules (forge-std)
 cd contracts && forge build && cd ..        # the bot injects the built GridQuoter for its quotes
 ```

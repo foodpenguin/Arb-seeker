@@ -4,7 +4,7 @@
 
 這個框架用來開發原子性的鏈上套利 bot：偵測價差、規劃一組 swap、用暫時性資金（閃電貸或閃電記帳）支應、對合約做精確檢查，然後送出。可重複使用的基礎設施（區塊／flashblock 驅動、送單流程、通用的 `StepArb` 合約）是通用的；策略透過 `OpportunitySource` 接進來，資金來源透過 `FlashLoan` / `FlashAccounting` 接進來。**Base 上的 Aero 合併套利**是第一個完整的策略。
 
-這個 crate 是一個函式庫（`arbitrage_framework`，`bot/src/lib.rs`）加上 Aero bot 的執行檔。鏈的基礎管線（RPC 連線池、heads、Flashblocks 串流、executor 和它的 task、送單關卡、模擬、共用的設定區段）是 `onchain-core` crate，和 `liquidation-framework` 共用，並以原本的模組名稱重新匯出；請把兩個 repo 並排 checkout。
+這個 crate 是一個函式庫（`arbitrage_framework`，`bot/src/lib.rs`）加上 Aero bot 的執行檔。鏈的基礎管線（RPC 連線池、heads、Flashblocks 串流、executor 和它的 task、送單關卡、模擬、共用的設定區段）是 `onchain-core` crate（repo 為 bot-onchain-core，鎖定 tag 的 git 依賴），和 Debt-keeper 共用，並以原本的模組名稱重新匯出。
 
 ## 驅動：`runner::run` + `OpportunitySource`（`bot/src/runner.rs`）
 

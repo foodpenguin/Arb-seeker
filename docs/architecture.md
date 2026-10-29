@@ -11,8 +11,8 @@ complete strategy.
 
 The crate is a library (`arbitrage_framework`, `bot/src/lib.rs`) plus the Aero bot binary. The
 chain plumbing (RPC pool, heads, Flashblocks stream, executor and its task, send gates, simulation,
-the shared config sections) is the `onchain-core` crate, shared with `liquidation-framework` and
-re-exported under its usual module names; check the repositories out side by side.
+the shared config sections) is the `onchain-core` crate (repository bot-onchain-core, a git
+dependency pinned to a tag), shared with Debt-keeper and re-exported under its usual module names.
 
 ## The driver: `runner::run` + `OpportunitySource` (`bot/src/runner.rs`)
 

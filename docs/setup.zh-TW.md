@@ -15,12 +15,11 @@ curl -L https://foundry.paradigm.xyz | bash && ~/.foundry/bin/foundryup  # forge
 
 ## 2. 取得程式碼
 
-bot 以路徑依賴 `onchain-core` crate，所以兩個 repo 要並排 clone：
+bot 建立在 `onchain-core` crate 上，它是 git 依賴，cargo 會自己抓：
 
 ```bash
-git clone <onchain-core-url> onchain-core
-git clone --recurse-submodules <repo-url> arbitrage-framework
-cd arbitrage-framework
+git clone --recurse-submodules https://github.com/foodpenguin/Arb-seeker.git
+cd Arb-seeker
 git submodule update --init --recursive    # 如果 clone 時沒加 --recurse-submodules（forge-std）
 cd contracts && forge build && cd ..        # bot 報價時會注入編譯好的 GridQuoter
 ```

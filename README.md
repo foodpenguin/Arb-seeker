@@ -1,4 +1,4 @@
-# arbitrage-framework
+# Arb-seeker
 
 [繁體中文](README.zh-TW.md)
 
@@ -8,7 +8,8 @@ sending and the choice of transient capital are generic; a strategy plugs in thr
 any trade it can write as steps runs on one generic contract (`StepArb.sol`).
 **Aero merger arbitrage on Base** (old AERO converts 1:1 into new AERO: buy old, migrate, sell new,
 repay, in one transaction, with no capital of your own) is the example strategy. The chain plumbing
-comes from `onchain-core`, shared with `liquidation-framework`.
+comes from [bot-onchain-core](https://github.com/foodpenguin/bot-onchain-core) (crate `onchain-core`),
+shared with [Debt-keeper](https://github.com/foodpenguin/Debt-keeper). This crate is `arbitrage-framework`.
 
 > **Status:** experimental. Nothing here is financial advice and nothing is tuned for you: the
 > example configuration uses neutral values. Run it in observe mode, test sends on an anvil fork,
@@ -69,8 +70,15 @@ docs/            architecture and setup (English / 繁體中文)
 
 ## Building
 
-This crate depends on `onchain-core` by path: check the repositories out side by side
-(`<dir>/onchain-core`, `<dir>/arbitrage-framework`).
+`onchain-core` is a git dependency pinned to a tag (`bot/Cargo.toml`); cargo fetches it, nothing to
+check out by hand. To build against a local checkout of bot-onchain-core (e.g. while changing both),
+override it from `bot/`:
+
+```
+cargo test --config 'patch."https://github.com/foodpenguin/bot-onchain-core".onchain-core.path="../../bot-onchain-core"'
+```
+
+The override rewrites `bot/Cargo.lock`; do not commit that change.
 
 ## Quick start
 
