@@ -2,9 +2,9 @@
 
 [English](architecture.md)
 
-這個框架用來開發原子性的鏈上套利 bot：偵測價差、規劃一組 swap、用暫時性資金（閃電貸或閃電記帳）支應、對合約做精確檢查，然後送出。可重複使用的基礎設施（區塊／flashblock 驅動、送單流程、通用的 `StepArb` 合約）是通用的；策略透過 `OpportunitySource` 接進來，資金來源透過 `FlashLoan` / `FlashAccounting` 接進來。**Base 上的 Aero 合併套利**是第一個完整的策略。
+這個框架用來開發原子性的鏈上套利 bot：偵測價差、規劃一組 swap、用暫時性資金（閃電貸或閃電記帳）支應、對合約做精確檢查，然後送出。可重複使用的基礎設施（區塊驅動、送單流程、通用的 `StepArb` 合約）是通用的；策略透過 `OpportunitySource` 接進來，資金來源透過 `FlashLoan` / `FlashAccounting` 接進來。**Base 上的 Aero 合併套利**是第一個完整的策略。
 
-這個 crate 是一個函式庫（`arbitrage_framework`，`bot/src/lib.rs`）加上 Aero bot 的執行檔。鏈的基礎管線（RPC 連線池、heads、Flashblocks 串流、executor 和它的 task、送單關卡、模擬、共用的設定區段）是 `onchain-core` crate（repo 為 bot-onchain-core，鎖定 tag 的 git 依賴），和 Debt-keeper 共用，並以原本的模組名稱重新匯出。
+這個 crate 是一個函式庫（`arbitrage_framework`，`bot/src/lib.rs`）加上 Aero bot 的執行檔。鏈的基礎管線（RPC 連線池、heads、executor 和它的 task、送單關卡、模擬、共用的設定區段）是 `onchain-core` crate（repo 為 bot-onchain-core，鎖定 tag 的 git 依賴），和 Debt-keeper 共用，並以原本的模組名稱重新匯出。
 
 ## 驅動：`runner::run` + `OpportunitySource`（`bot/src/runner.rs`）
 
@@ -12,18 +12,17 @@
 pub trait OpportunitySource<P> {
     fn name(&self) -> &'static str;
     fn on_block(&mut self, p: &P, head: &Head, exec: Option<&ExecHandle>) -> impl Future<Output = Result<()>> + Send;
-    fn on_flashblocks(&mut self, p: &P, first: Flashblock, rx: &mut mpsc::Receiver<Flashblock>,
-                      exec: Option<&ExecHandle>, last_block: u64) -> impl Future<Output = Result<()>> + Send;
     fn on_outcome(&mut self, block: u64, inflight: &Inflight, outcome: &Outcome,
                   gas_spent_total_wei: U256, cooldown_started: bool) -> Result<()>;
 }
 ```
 
-`runner::run(&mut strategy, provider, executor, heads, flashblocks, RunnerOpts { poll_ms, ws_quiet })` 負責排程：
+`runner::run(&mut strategy, provider, executor, heads, RunnerOpts { poll_ms, ws_quiet })` 負責排程：
 
 - 新區塊來自 WebSocket `newHeads`（多個端點），去重並保證嚴格遞增；WS 安靜超過 `ws_quiet` 時，每 `poll_ms` 用 HTTP 輪詢；
-- executor（實跑模式）作為獨立的 task 執行（`onchain_core::actor`）：驅動把每個新區塊公告給它，它輪詢在飛交易的 receipt，已結算的交易經由驅動迴圈送到 `on_outcome`（含 gas 計算，以及它是否觸發了失敗冷卻）；接著每個新區塊呼叫 `on_block`，呼叫前會短暫等該區塊的 receipt 查完（`wait_polled`，最多 `RECEIPT_WAIT`），並先把結算結果交給 `on_outcome`，讓這個區塊剛上鏈的交易不再算在飛、它的帳（例如預算預留）也先結清。策略透過交給它的 `ExecHandle` 送單；
-- 策略有同塊模式時，flashblocks 批次（第一個加上排在後面的）-> `on_flashblocks`。
+- executor（實跑模式）作為獨立的 task 執行（`onchain_core::actor`）：驅動把每個新區塊公告給它，它輪詢在飛交易的 receipt，已結算的交易經由驅動迴圈送到 `on_outcome`（含 gas 計算，以及它是否觸發了失敗冷卻）；接著每個新區塊呼叫 `on_block`，呼叫前會短暫等該區塊的 receipt 查完（`wait_polled`，最多 `RECEIPT_WAIT`），並先把結算結果交給 `on_outcome`，讓這個區塊剛上鏈的交易不再算在飛、它的帳（例如預算預留）也先結清。策略透過交給它的 `ExecHandle` 送單。
+
+Base Denim 已移除 Flashblocks 與進行中（`pending`）狀態，所以驅動沒有同塊路徑；在 200 ms 出塊下，以每個封裝好的 head 觸發 `on_block`。
 
 hook 只在致命錯誤時回傳 `Err`（驅動會停止）；可恢復的錯誤由策略自己記 log 並吞掉。觀察模式下 `exec` 是 `None`。
 
@@ -72,7 +71,7 @@ hook 只在致命錯誤時回傳 `Err`（驅動會停止）；可恢復的錯誤
 
 ## 送單流程：`ArbExecutor`（`bot/src/arb_exec.rs`）
 
-從「策略找到機會」到「送出交易」之間的事情，適用於任何會回傳利潤的原子套利合約。策略依偏好順序，為每一種吃下機會的方式建一個 `Candidate { calldata, gas_est, floor_usd, l1_usd }`，並提供兩樣東西：怎麼呼叫（`call`：在它報價時的那個狀態上執行一個 `TransactionRequest` 的 closure，例如封裝好的區塊，或重播過的進行中區塊），以及怎麼把利潤代幣換算成 USD。
+從「策略找到機會」到「送出交易」之間的事情，適用於任何會回傳利潤的原子套利合約。策略依偏好順序，為每一種吃下機會的方式建一個 `Candidate { calldata, gas_est, floor_usd, l1_usd }`，並提供兩樣東西：怎麼呼叫（`call`：在它報價時的那個狀態上執行一個 `TransactionRequest` 的 closure，即封裝好的區塊），以及怎麼把利潤代幣換算成 USD。
 
 1. `exact(candidates, call)`：所有候選平行地對合約執行，計價方式和真實交易相同（基本 priority fee、gas limit、max fee = 2 × base fee + priority），因為有些 venue 會讀 `tx.gasprice`；回傳資料由合約專屬的 `decode` 解碼。
 2. `pick(candidates, exact, usd)` -> `Picked { index, profit, gross_usd, net_usd }`：淨利 = 利潤減掉該候選的模型 gas（`gas_cost_usd`），再減掉它的 L1 data fee（`l1_usd`，由策略用 `l1_fee_wei` 填入，也就是 GasPriceOracle 依 calldata 大小給出的上限）；先選達到門檻的，再選淨利高的；完全平手時保留較前面的候選。
@@ -93,15 +92,15 @@ hook 只在致命錯誤時回傳 `Err`（驅動會停止）；可恢復的錯誤
 - **探索**（每幾十個區塊一次）：向每個設定的 factory，以及賣方的 Aero FactoryRegistry，查詢舊或新 AERO 對借款代幣的池子（CL 會查每一種 tick spacing）；沒有流動性的池子略過。地址放在 `[aero]`，不寫死在程式碼。
 - **報價**（每個區塊，固定在 head 的區塊高度上，所以每次讀取看到的是同一個狀態）：一次 multicall 取得 USD 價格和 V2 報價；CL 池用 state override 注入的 `GridQuoter` 報價。買方曲線依一組借款金額報價，賣方曲線依一組 AERO 數量報價。
 - **規劃**：每個借款金額把輸入 greedy 分配到各買方池（對凹曲線是最佳解），買到的舊 AERO 同樣分配到各賣方池；淨利最高的金額勝出。估算會扣掉已啟用來源中最便宜的閃電手續費和模型 gas。
-- **精確檢查和送單**都透過 `ArbExecutor`：每個金額（最佳金額和它的鄰近金額，各自重新分配）× 每個啟用的資金來源各一個 `Candidate`，Morpho 排在前面，所以完全平手時選它；每個候選有自己的模型 gas（`arb_gas`）和依借款金額的門檻。`call` 在封裝好的區塊上執行，同塊模式下則在重播過的進行中區塊上執行。L1 data fee（和精確檢查一起讀一次，以最大的 calldata 為準）計入每個候選的淨利。只有精確檢查的結果會被送出，`minProfit = 精確利潤 × min_profit_keep`，期限是 `[aero] deadline_secs` 依區塊頭實測的出塊時間換算。
+- **精確檢查和送單**都透過 `ArbExecutor`：每個金額（最佳金額和它的鄰近金額，各自重新分配）× 每個啟用的資金來源各一個 `Candidate`，Morpho 排在前面，所以完全平手時選它；每個候選有自己的模型 gas（`arb_gas`）和依借款金額的門檻。`call` 在封裝好的區塊上執行。L1 data fee（和精確檢查一起讀一次，以最大的 calldata 為準）計入每個候選的淨利。只有精確檢查的結果會被送出，`minProfit = 精確利潤 × min_profit_keep`，期限是 `[aero] deadline_secs` 依區塊頭實測的出塊時間換算。
 - **每日 gas 預算**：一筆交易若 revert 時的最壞成本（以它的 priority 計的 L2 gas + L1 fee）會讓今天 revert 套利的花費超過 `[exec] daily_gas_budget_usd`，就不送；`on_outcome` 會釋放預留，並把每筆 revert 套利的實際成本記上。
 - **USD 價格**：不是 USD 穩定幣的借款代幣會在同一個 multicall 裡計價：有設定 Chainlink feed（`usd_feed`，8 位小數，`latestRoundData`）而且夠新（在 `[aero] usd_feed_max_age_secs` 內更新過，預設 3600）就用 feed，否則用池子報價（`usd_pool`，`getAmountOut`）；優先用 feed，因為池子可能被抽乾或被推動。範例用 Base 的 ETH/USD feed 為 WETH 計價。第一個有計價的代幣也提供 `eth_usd`。
 - **合約**（`[aero] contract_kind`）：`"migration"`（預設）= AeroMigrationArb，內建遷移；`"steps"` = StepArb，遷移寫成買和賣之間的一個 kind 0 步驟（`depositLiquid(all old AERO, contract)`），舊／新 AERO 都會清走；這時 pre-flight 改成檢查 Migration 是白名單內的 target，而不是讀 `MIGRATION()`。
 - **資金**（`[aero] funding`）：`"morpho"`（預設）呼叫 `arb`；`"v4"` 呼叫 `arbFlashAccounting`；`"auto"` 每個金額都同時用兩個入口精確檢查（eth_call 變兩倍），依各來源自己的模型 gas 扣除後送出淨利較高的。只要設定了 `[aero] contract`（觀察模式也一樣），bot 就會檢查合約的 `MORPHO()` / `POOL_MANAGER()` 和設定一致，不一致就拒絕啟動。實跑的 pre-flight 也會拒絕 `PROFIT_RECEIVER` 是熱錢包的合約。
 - **實跑**需要設定檔裡的 `[exec] mode = "live"` 和命令列的 `--live` 兩者同時成立（單靠一個誤加的旗標或一份複製來的設定都不會送單），另外還要 `exec.keystore` 和 `[aero] contract`。
-- **同塊模式**（`[aero] same_block`，Base Flashblocks）：只要進行中區塊的 flashblocks 帶有可能影響我們池子的交易，就在該區塊上跑同一套流程；那些交易會先在封裝好的區塊上重播，再做報價和精確檢查，所以區塊前段打開的價差可以在同一塊被吃掉。learner 會記錄哪些交易目標真的動到我們的池子，無關的交易不會觸發流程。
+- **沒有同塊模式**：Base Denim 已移除 Flashblocks 與進行中（`pending`）狀態，所以只在每個封裝好的 head 上跑。在 200 ms 出塊下，價差在下一塊被吃掉。
 - **priority fee**：`bid_policy` 把 `[aero]`（`priority_fee_wei`、`bid_min_profit_usd`、`bid_share`、`bid_max_priority_wei`）轉成 `BidPolicy`，由 `ArbExecutor::terms` 套用：基本的 priority fee，大額精確利潤時可以拿出一部分出價；出價會在它自己的 priority 下重新檢查（Aero 池子會對 priority fee 抽稅），並受錢包餘額限制。
-- **journal**：寫在 `[aero] journal_path` 的 JSON 行（`aero_start`、`aero_venue`、`aero_tick`、`aero_opp`、`aero_sent`、`aero_outcome`、`aero_cooldown`、`aero_learned`、`aero_same_block`）；沒有設定 `contract` 或沒有 `--live` 時只觀察。
+- **journal**：寫在 `[aero] journal_path` 的 JSON 行（`aero_start`、`aero_venue`、`aero_tick`、`aero_opp`、`aero_sent`、`aero_outcome`、`aero_cooldown`）；沒有設定 `contract` 或沒有 `--live` 時只觀察。
 
 ## 基礎設施
 
@@ -110,7 +109,7 @@ hook 只在致命錯誤時回傳 `Err`（驅動會停止）；可恢復的錯誤
 | `config` | 套利專用設定；`[[rpc]]` / `env_file` 和 `[exec]` 是 onchain-core 的 `RpcSettings` / `SendSettings`（URL 只從 `.env` 來；相對路徑的 `kill_switch_file` 或 `env_file` 以設定檔所在目錄為基準） |
 | `chain`、`num`（onchain-core） | Multicall3 讀取、單位換算工具 |
 | `rpc`（onchain-core） | 多端點連線池：競速／備援、每個端點的方法和 log 範圍限制、落後處理；容量錯誤以片語判斷（限流／方案／範圍限制），確定性錯誤（revert、gas limit、餘額不足、nonce……）絕不換端點；log 只顯示端點名稱 |
-| `heads`、`flashblocks`（onchain-core） | 新區塊訊號（WS `newHeads`，多個端點）；Base Flashblocks 原始串流 |
+| `heads`（onchain-core） | 新區塊訊號（WS `newHeads`，多個端點；重連退避與端點 parking） |
 | `executor`、`actor`（onchain-core） | keystore 簽名、透過暖機中的連線廣播給所有端點（加上可選的 `extra_broadcast`）、以錢包為單位共用的版本化 nonce 檔（`~/.local/state/onchain-bots/nonce-<錢包>`；fail closed：鎖不到或格式不認得就不送）、卡住交易的取代、失敗冷卻（`[exec]` 的 `failure_window_secs` 內 `max_failures_in_window` 筆失敗就暫停送單 `failure_cooldown_secs`）；executor 作為獨立的 task。這裡一次只有一筆套利在飛（`max_inflight` 1） |
 | `gates`（onchain-core） | 緊急停止、revert 的每日預算、期限、gas 和 L1 fee 成本 |
 | `runner` | 上面說的驅動 |
@@ -122,9 +121,9 @@ hook 只在致命錯誤時回傳 `Err`（驅動會停止）；可恢復的錯誤
 ## 加入一個策略
 
 1. 建立 `bot/src/<strategy>.rs`，用一個 struct 保存策略狀態，constructor 負責驗證它的設定區段並做一次性的讀取。
-2. 實作 `OpportunitySource`：`on_block` 處理每個封裝好的區塊；有同塊模式才需要 `on_flashblocks`（否則忽略那批資料）；`on_outcome` 處理你送出的交易的結果。
+2. 實作 `OpportunitySource`：`on_block` 處理每個封裝好的區塊；`on_outcome` 處理你送出的交易的結果。
 3. 只在致命錯誤時回傳 `Err`。可恢復的錯誤（RPC 不穩、報價失敗）記 log 即可。
-4. 在 `main.rs` 呼叫 `runner::run(&mut strategy, provider, executor, heads, flashblocks, opts)`。
+4. 在 `main.rs` 呼叫 `runner::run(&mut strategy, provider, executor, heads, opts)`。
 5. `runner.rs` 裡的 runner 測試用假的策略驅動 driver；照著它為你的策略寫一個。
 6. 透過 `ArbExecutor` 送單（參考 Aero 的 `tick`）：建好 `Candidate`，提供你的 `call` 和 USD 換算，然後在 `ExecHandle` 上 `exact` -> `pick` -> `terms` -> `send`（帶上 `Gates`）。合約必須回傳利潤（設定 `decode`），並在 calldata 裡接收 `minProfit`（`min_profit_slot`），這樣精確檢查才準確，合約也會強制執行門檻：StepArb 都做到了，所以最簡單的做法是把交易寫成步驟（見上方）。
 

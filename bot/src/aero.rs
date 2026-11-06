@@ -19,25 +19,21 @@
 //! Without `[aero] contract` (or without --live) it only journals what it sees: venues, spreads and
 //! estimated profits (kind "aero_*", in [aero] journal_path).
 //!
-//! Same-block mode ([aero] same_block, Base flashblocks until Denim): the same pass also runs on
-//! the in-progress block, whenever its flashblocks carry txs that may move our pools; those txs
-//! are replayed on the sealed head ahead of the quotes and the exact check (`At::Pending`), so a
-//! spread opened early in a block can be taken in that same block.
+//! The pass runs on each sealed head. Base Denim removed Flashblocks and the in-progress ("pending")
+//! state, so there is no same-block path; at 200 ms blocks a spread is taken in the next block.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     io::Write,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use alloy::{
-    consensus::{Transaction, TxEnvelope, transaction::SignerRecoverable},
-    eips::{BlockId, eip2718::Decodable2718},
-    primitives::{Address, B256, Bytes, U256, address, keccak256},
+    eips::BlockId,
+    primitives::{Address, Bytes, U256, address},
     providers::Provider,
     rpc::types::{
-        BlockOverrides, Filter, TransactionRequest,
-        simulate::{SimBlock, SimCallResult, SimulatePayload},
+        TransactionRequest,
         state::{AccountOverride, StateOverride},
     },
     sol,
@@ -45,7 +41,6 @@ use alloy::{
 };
 use anyhow::{Context, Result, bail};
 use serde_json::json;
-use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::{
@@ -57,8 +52,7 @@ use crate::{
     chain::multicall,
     executor::{Executor, Inflight, MinProfitSlot, Outcome},
     flash::{self, FlashAccounting, FlashLoan, MorphoBlue, UniswapV4},
-    flashblocks::Flashblock,
-    heads::{self, Head},
+    heads::Head,
     num as math,
     runner::{self, OpportunitySource, RunnerOpts},
 };
@@ -95,282 +89,19 @@ sol! {
     }
 }
 
-/// What the quotes and the exact check run on.
-enum At {
-    /// A sealed block: eth_call.
-    Sealed(BlockId),
-    /// The in-progress block, as far as its flashblocks go.
-    Pending(PendingAt),
-}
-
-/// The in-progress block `base + 1`: `prefix` (its txs that may move our pools, in block order) is
-/// replayed on the sealed `base` with eth_simulateV1, then the call. Replaying just the txs that
-/// touch the pools reproduced every pool's state at the next block exactly (2026-10-22,
-/// examples/aero_prefix_check.rs). "pending" eth_calls are no way round it: every endpoint served
-/// state 2-4 blocks old mid-block (examples/fb_pending_probe.rs), though receipts were current.
-struct PendingAt {
-    base: u64,
-    timestamp: u64,
-    base_fee: u128,
-    prefix: Vec<TransactionRequest>,
-    /// prefix[fresh..] are this pass's new candidates, not yet known to touch a pool.
-    fresh: usize,
-    /// Newest flashblock in: index and arrival (journaled latency).
-    index: u64,
-    seen: Instant,
-}
-
-impl PendingAt {
-    /// The same block with only the txs that matter: the known prefix and the new candidates that
-    /// touched a pool (`touched`: per prefix tx, from the quote's replay). The exact check runs on it.
-    fn keep(&self, touched: &[bool]) -> PendingAt {
-        let prefix: Vec<TransactionRequest> = self.prefix.iter().zip(touched).enumerate().filter(|(i, (_, hit))| *i < self.fresh || **hit).map(|(_, (tx, _))| tx.clone()).collect();
-        PendingAt { base: self.base, timestamp: self.timestamp, base_fee: self.base_fee, fresh: prefix.len(), prefix, index: self.index, seen: self.seen }
-    }
-}
-
-impl At {
-    fn label(&self) -> &'static str {
-        match self {
-            At::Sealed(_) => "latest",
-            At::Pending(_) => "flashblock",
-        }
-    }
-
-    /// Journal field: flashblock index, ms since it arrived, txs replayed (of which new candidates).
-    fn fb(&self) -> serde_json::Value {
-        match self {
-            At::Sealed(_) => serde_json::Value::Null,
-            At::Pending(pa) => json!({ "index": pa.index, "ms": pa.seen.elapsed().as_millis() as u64, "replayed": pa.prefix.len(), "new": pa.prefix.len() - pa.fresh }),
-        }
-    }
-}
-
-/// `pa.prefix` + `tx` on `pa.base`, as block base + 1, validation off (as eth_call); every call's
-/// result.
-async fn simulate<P: Provider>(p: &P, pa: &PendingAt, tx: TransactionRequest, ov: Option<&StateOverride>) -> Result<Vec<SimCallResult>> {
-    let mut calls = pa.prefix.clone();
-    calls.push(tx);
-    let payload = SimulatePayload {
-        block_state_calls: vec![SimBlock {
-            block_overrides: Some(BlockOverrides { number: Some(U256::from(pa.base + 1)), time: Some(pa.timestamp), base_fee: Some(U256::from(pa.base_fee)), ..Default::default() }),
-            state_overrides: ov.cloned(),
-            calls,
-        }],
-        trace_transfers: false,
-        validation: false,
-        return_full_transactions: false,
-    };
-    let mut blocks = p.simulate(&payload).block_id(BlockId::number(pa.base)).await?;
-    anyhow::ensure!(blocks.len() == 1, "simulate returned {} blocks", blocks.len());
-    Ok(blocks.remove(0).calls)
-}
-
-/// One call on `at`; a revert is an error, as with eth_call.
-async fn call_at<P: Provider>(p: &P, tx: TransactionRequest, at: &At) -> Result<Bytes> {
-    match at {
-        At::Sealed(id) => Ok(p.call(tx).block(*id).await?),
-        At::Pending(pa) => {
-            let r = simulate(p, pa, tx, None).await?;
-            let last = r.last().context("empty simulate result")?;
-            match &last.error {
-                None if last.status => Ok(last.return_data.clone()),
-                e => bail!("{}", e.as_ref().map_or("execution reverted", |e| e.message.as_str())),
-            }
-        }
-    }
+/// One call on a sealed block; a revert is an error, as with eth_call.
+async fn call_at<P: Provider>(p: &P, tx: TransactionRequest, at: BlockId) -> Result<Bytes> {
+    Ok(p.call(tx).block(at).await?)
 }
 
 /// One Multicall3 call carrying every quote of a block, with the GridQuoter injected by state
 /// override (it applies to the whole call, so the multicall can reach it). Failed sub-calls are None.
-/// On a pending block the replay also tells which prefix txs touched `pools` (else None).
-async fn multicall_ov<P: Provider>(p: &P, calls: &[(Address, Bytes)], ov: &StateOverride, at: &At, pools: &HashSet<Address>) -> Result<(Vec<Option<Bytes>>, Option<Vec<bool>>)> {
+async fn multicall_ov<P: Provider>(p: &P, calls: &[(Address, Bytes)], ov: &StateOverride, at: BlockId) -> Result<Vec<Option<Bytes>>> {
     let req: Vec<Call3A> = calls.iter().map(|(t, d)| Call3A { target: *t, allowFailure: true, callData: d.clone() }).collect();
     let data: Bytes = IMulticall3A::aggregate3Call { calls: req }.abi_encode().into();
     let tx = TransactionRequest::default().to(crate::chain::MULTICALL3).input(data.into());
-    let (out, touched) = match at {
-        At::Sealed(id) => (p.call(tx).block(*id).overrides(ov.clone()).await.context("aero quotes (multicall)")?, None),
-        At::Pending(pa) => {
-            let r = simulate(p, pa, tx, Some(ov)).await.context("aero quotes (simulate)")?;
-            let (last, replayed) = r.split_last().context("empty simulate result")?;
-            anyhow::ensure!(replayed.len() == pa.prefix.len(), "simulate returned {} results for {} txs", r.len(), pa.prefix.len() + 1);
-            anyhow::ensure!(last.status, "aero quotes (simulate): the multicall reverted");
-            (last.return_data.clone(), Some(replayed.iter().map(|c| c.logs.iter().any(|l| pools.contains(&l.inner.address))).collect()))
-        }
-    };
-    Ok((IMulticall3A::aggregate3Call::abi_decode_returns(&out)?.into_iter().map(|r| r.success.then_some(r.returnData)).collect(), touched))
-}
-
-/// Addresses that make a streamed tx a same-block candidate (our pools, both AERO tokens, learned
-/// bot contracts), with a table of their first two bytes so that most calldata windows are
-/// rejected without hashing. A call straight to an `inert` address (the AERO tokens: transfer,
-/// approve) cannot move a pool, and those were most of the candidates.
-struct Watch {
-    set: HashSet<Address>,
-    inert: HashSet<Address>,
-    lead: Vec<bool>,
-}
-
-impl Watch {
-    fn new(addrs: impl IntoIterator<Item = Address>, inert: impl IntoIterator<Item = Address>) -> Self {
-        let inert: HashSet<Address> = inert.into_iter().collect();
-        let set: HashSet<Address> = addrs.into_iter().chain(inert.iter().copied()).collect();
-        let mut lead = vec![false; 1 << 16];
-        for a in &set {
-            lead[usize::from(a[0]) << 8 | usize::from(a[1])] = true;
-        }
-        Self { set, inert, lead }
-    }
-
-    /// `to` is watched, or the calldata names a watched address anywhere (ABI words or packed);
-    /// never a call straight to an inert address.
-    fn hit(&self, to: Option<Address>, input: &[u8]) -> bool {
-        if to.is_some_and(|t| self.inert.contains(&t)) {
-            return false;
-        }
-        to.is_some_and(|t| self.set.contains(&t)) || input.windows(20).any(|w| self.lead[usize::from(w[0]) << 8 | usize::from(w[1])] && self.set.contains(&Address::from_slice(w)))
-    }
-}
-
-/// The in-progress block as its flashblocks arrive.
-struct Pending {
-    block: u64,
-    timestamp: u64,
-    base_fee: u128,
-    next_index: u64,
-    /// A flashblock went missing, the prefix outgrew MAX_PREFIX or the replay failed twice: this
-    /// block is left to the per-head pass.
-    broken: bool,
-    /// Passes whose replay failed (the node lacks the base yet, or a candidate breaks the request).
-    failures: u32,
-    /// Txs that touched a pool in our replay, in block order.
-    prefix: Vec<TransactionRequest>,
-    /// Candidates not replayed yet.
-    fresh: Vec<TransactionRequest>,
-    index: u64,
-    seen: Instant,
-}
-
-/// Same-block mode state.
-#[derive(Default)]
-struct SameBlock {
-    pending: Option<Pending>,
-    /// tx hash -> (`to`, block, caught by the watch, calldata bytes) of every streamed tx, for the
-    /// learner.
-    recent_to: HashMap<B256, (Address, u64, bool, u32)>,
-    /// Contracts seen trading on our pools without naming them in calldata -> last block they did.
-    learned: HashMap<Address, u64>,
-    /// Last block the learner covered.
-    learned_to: u64,
-    /// Since the last stats row: blocks opened, broken ones, passes run, passes whose new
-    /// candidates moved a pool, failed replays.
-    stats: SameBlockStats,
-}
-
-#[derive(Default, Debug, Clone, Copy, serde::Serialize)]
-struct SameBlockStats {
-    blocks: u64,
-    broken: u64,
-    passes: u64,
-    moved: u64,
-    failed: u64,
-}
-
-impl SameBlock {
-    /// Takes a flashblock in: index 0 opens a block (it carries the timestamp and base fee), a
-    /// missed index breaks it (an unseen tx may have moved a pool), candidates join `fresh`.
-    fn absorb(&mut self, fb: Flashblock, watch: &Watch) {
-        if fb.index == 0 {
-            self.stats.blocks += 1;
-            self.stats.broken += u64::from(self.pending.as_ref().is_some_and(|pd| pd.broken));
-            self.recent_to.retain(|_, (_, b, _, _)| *b + KEEP_TO_BLOCKS > fb.block);
-            self.pending = match (fb.timestamp, fb.base_fee) {
-                (Some(timestamp), Some(base_fee)) => Some(Pending { block: fb.block, timestamp, base_fee, next_index: 0, broken: false, failures: 0, prefix: vec![], fresh: vec![], index: 0, seen: fb.seen }),
-                _ => None,
-            };
-        }
-        let mut fresh = vec![];
-        for raw in &fb.txs {
-            let Ok(tx) = TxEnvelope::decode_2718(&mut &raw[..]) else { continue }; // deposits (0x7e)
-            let to = tx.to();
-            let hit = watch.hit(to, tx.input());
-            if let Some(to) = to {
-                self.recent_to.insert(keccak256(raw), (to, fb.block, hit, tx.input().len() as u32));
-            }
-            if hit
-                && let Ok(from) = tx.recover_signer()
-            {
-                let mut req = TransactionRequest::from_transaction_with_sender(tx, from);
-                req.nonce = None; // the node takes the sender's nonce as it stands in the replay
-                fresh.push(req);
-            }
-        }
-        let Some(pd) = self.pending.as_mut().filter(|pd| pd.block == fb.block) else { return };
-        pd.broken |= fb.index != pd.next_index;
-        pd.next_index = fb.index + 1;
-        pd.index = fb.index;
-        pd.seen = fb.seen;
-        pd.fresh.extend(fresh);
-        pd.broken |= pd.prefix.len() + pd.fresh.len() > MAX_PREFIX;
-    }
-}
-
-/// Learner: the contracts behind our pools' logs since its last pass that no watched address
-/// catches yet (bots that keep pools in storage or pack them: 36% of pool txs were missed without
-/// it, 2026-10-22). One eth_getLogs per LEARN_EVERY blocks. A contract is learned only if enough
-/// of its streamed txs in that range moved our pools, or it did repeatedly at a small replay cost
-/// (LEARN_SHARE, LEARN_MAX_BYTES): a hub whose big txs mostly do not (the ERC-4337 EntryPoint, a
-/// generic aggregator) would make nearly every flashblock a costly candidate. One that has not traded on our pools for LEARN_EXPIRE blocks is dropped. Returns
-/// whether the learned set changed.
-async fn learn<P: Provider>(p: &P, sb: &mut SameBlock, paths: &[Path], watch: &Watch, head: u64, journal: &mut std::fs::File) -> Result<bool> {
-    let pools: Vec<Address> = paths.iter().map(|x| x.venue.pool).collect::<HashSet<_>>().into_iter().collect();
-    let from = if sb.learned_to == 0 { head.saturating_sub(LEARN_EVERY) } else { sb.learned_to + 1 };
-    sb.learned_to = head; // a failed pass waits for the next one, too
-    let logs = p.get_logs(&Filter::new().address(pools).from_block(from).to_block(head)).await?;
-    let before: HashSet<Address> = sb.learned.keys().copied().collect();
-    for (to, n, total, learned) in sb.learn_from(&logs.iter().filter_map(|l| l.transaction_hash).collect(), watch, from, head) {
-        info!(contract = %to, pool_txs = n, txs = total, learned, block = head, "aero: contract trading on our pools unseen by the watch");
-        writeln!(journal, "{}", json!({ "kind": "aero_learned", "block": head, "contract": to, "pool_txs": n, "txs": total, "learned": learned }))?;
-    }
-    Ok(sb.learned.keys().copied().collect::<HashSet<_>>() != before)
-}
-
-impl SameBlock {
-    /// The learner's decisions for the pool txs of blocks `from..=head`: (contract, its pool txs, its
-    /// streamed txs, learned?) per contract the watch missed; refreshes and expires learned ones.
-    fn learn_from(&mut self, pool_txs: &HashSet<B256>, watch: &Watch, from: u64, head: u64) -> Vec<(Address, u64, u64, bool)> {
-        let mut hits: HashMap<Address, u64> = HashMap::new();
-        for h in pool_txs {
-            let Some((to, _, caught, _)) = self.recent_to.get(h).copied() else { continue };
-            if let Some(last) = self.learned.get_mut(&to) {
-                *last = head;
-            } else if !caught && !watch.set.contains(&to) {
-                *hits.entry(to).or_default() += 1;
-            }
-        }
-        let blocks = (head + 1).saturating_sub(from).max(1);
-        let mut out = vec![];
-        for (to, n) in hits {
-            let (total, bytes) = self.recent_to.values().filter(|(t, b, _, _)| *t == to && *b >= from).fold((0u64, 0u64), |(c, s), (_, _, _, len)| (c + 1, s + u64::from(*len)));
-            // Mostly on our pools, or a bot that trades here repeatedly and costs little to replay
-            // (e.g. a few small txs out of hundreds).
-            let learned = n * LEARN_SHARE >= total || (n >= 2 && bytes / blocks <= LEARN_MAX_BYTES);
-            if learned {
-                self.learned.insert(to, head);
-            }
-            out.push((to, n, total, learned));
-        }
-        self.learned.retain(|_, last| head.saturating_sub(*last) <= LEARN_EXPIRE);
-        while self.learned.len() > MAX_LEARNED {
-            let oldest = self.learned.iter().min_by_key(|(_, last)| **last).map(|(a, _)| *a).expect("not empty");
-            self.learned.remove(&oldest);
-        }
-        out
-    }
-}
-
-fn watch_for(a: &AeroConfig, paths: &[Path], sb: &SameBlock) -> Watch {
-    Watch::new(paths.iter().map(|x| x.venue.pool).chain(sb.learned.keys().copied()), [a.old_token, a.new_token])
+    let out = p.call(tx).block(at).overrides(ov.clone()).await.context("aero quotes (multicall)")?;
+    Ok(IMulticall3A::aggregate3Call::abi_decode_returns(&out)?.into_iter().map(|r| r.success.then_some(r.returnData)).collect())
 }
 
 /// ABI arb(...): minProfit is the 5th head word.
@@ -394,21 +125,6 @@ const SPLIT_CHUNKS: usize = 32;
 /// Fixed sell amounts are planned x this (the bought amount can come in a little lower); the
 /// largest sell pool takes whatever is left.
 const SELL_FIXED_SHARE: f64 = 0.98;
-
-/// Same-block mode: at most this many txs replayed ahead of a quote (past it, the block is left to
-/// the per-head pass).
-const MAX_PREFIX: usize = 64;
-/// Learner pass every this many blocks; at most MAX_LEARNED contracts, oldest out.
-const LEARN_EVERY: u64 = 30;
-const MAX_LEARNED: usize = 64;
-/// A contract is learned when >= 1 / LEARN_SHARE of its txs moved our pools, or >= 2 did and its
-/// txs add at most LEARN_MAX_BYTES of calldata per block to replay; dropped after LEARN_EXPIRE
-/// blocks without.
-const LEARN_SHARE: u64 = 5;
-const LEARN_MAX_BYTES: u64 = 2048;
-const LEARN_EXPIRE: u64 = 1800;
-/// Streamed txs' `to` kept this many blocks for the learner.
-const KEEP_TO_BLOCKS: u64 = 64;
 
 /// V4 flash accounting vs the Morpho flash loan on the same route: 682k vs 703k gas (fork test
 /// test_v4FundingRepaysAndMatchesMorpho, 2026-10-28).
@@ -468,9 +184,6 @@ struct TickState {
     logged: HashMap<usize, (f64, u64)>,
     /// GridQuoter runtime code (state override).
     quoter: StateOverride,
-    /// Passes quoted on the in-progress block (head + 1 or later) / all passes (aero_tick fresh_share).
-    pending_hits: u64,
-    quotes: u64,
     /// Gas burned by reverted arbs today (exec.daily_gas_budget_usd).
     budget: crate::arb_exec::DailyBudget,
     /// (block, timestamp) the block time is measured from.
@@ -490,9 +203,9 @@ impl TickState {
     }
 }
 
-/// Aero merger arbitrage as an `OpportunitySource`: the state the per-block and same-block passes
-/// carry between events. The scheduling loop itself (heads / HTTP polling / flashblocks / receipt
-/// polls) is the generic `runner::run`.
+/// Aero merger arbitrage as an `OpportunitySource`: the state the per-block pass carries between
+/// events. The scheduling loop itself (heads / HTTP polling / receipt polls) is the generic
+/// `runner::run`.
 pub struct Aero<'a> {
     cfg: &'a Config,
     journal: std::fs::File,
@@ -501,10 +214,6 @@ pub struct Aero<'a> {
     token0s: HashMap<Address, Address>,
     last_discovery: u64,
     state: TickState,
-    sb: SameBlock,
-    watch: Watch,
-    /// Same-block mode (the flashblocks stream is wired in).
-    same_block: bool,
     /// The contract keeps pool factories in their own list (`allowedFactory`); false = a deployment
     /// from before the split, where factories are in `allowedTarget`.
     factory_list: bool,
@@ -522,7 +231,7 @@ fn factory_allowed_call(factory: Address, factory_list: bool) -> Bytes {
 
 impl<'a> Aero<'a> {
     /// Validates the config, pre-flights the contract when live, loads the GridQuoter code.
-    pub async fn start<P: Provider + Clone>(cfg: &'a Config, p: &P, live_wallet: Option<Address>, same_block: bool) -> Result<Self> {
+    pub async fn start<P: Provider + Clone>(cfg: &'a Config, p: &P, live_wallet: Option<Address>) -> Result<Self> {
         let a = &cfg.aero;
         validate(a)?;
         let mut journal = std::fs::OpenOptions::new().create(true).append(true).open(&a.journal_path).with_context(|| format!("opening journal {}", a.journal_path))?;
@@ -545,19 +254,15 @@ impl<'a> Aero<'a> {
         let code: Bytes = art["deployedBytecode"]["object"].as_str().context("quoter: no deployedBytecode")?.parse()?;
         let mut quoter = StateOverride::default();
         quoter.insert(SIM_QUOTER, AccountOverride { code: Some(code), ..Default::default() });
-        info!(live = live_wallet.is_some(), contract = ?a.contract, same_block, "aero: start");
-        writeln!(journal, "{}", json!({ "kind": "aero_start", "live": live_wallet.is_some(), "contract": a.contract, "same_block": same_block }))?;
+        info!(live = live_wallet.is_some(), contract = ?a.contract, "aero: start");
+        writeln!(journal, "{}", json!({ "kind": "aero_start", "live": live_wallet.is_some(), "contract": a.contract }))?;
         let state = TickState {
             usd: a.loan_tokens.iter().map(|l| if l.is_priced() { cfg.exec.eth_usd_fallback.max(1.0) } else { 1.0 }).collect(),
             logged: HashMap::new(),
             quoter,
-            pending_hits: 0,
-            quotes: 0,
             budget: Default::default(),
             bt_anchor: None,
         };
-        let sb = SameBlock::default();
-        let watch = watch_for(a, &[], &sb);
         Ok(Self {
             cfg,
             journal,
@@ -566,9 +271,6 @@ impl<'a> Aero<'a> {
             token0s: HashMap::new(),
             last_discovery: 0,
             state,
-            sb,
-            watch,
-            same_block,
             factory_list,
         })
     }
@@ -594,7 +296,6 @@ impl<P: Provider + Clone> OpportunitySource<P> for Aero<'_> {
                         }
                     }
                     self.paths = found;
-                    self.watch = watch_for(a, &self.paths, &self.sb);
                 }
                 Err(e) => warn!(error = %e, "aero: discovery failed"),
             }
@@ -602,27 +303,9 @@ impl<P: Provider + Clone> OpportunitySource<P> for Aero<'_> {
         if !self.paths.iter().any(|x| !x.buy) {
             return Ok(());
         }
-        if self.same_block && block >= self.sb.learned_to + LEARN_EVERY {
-            match learn(p, &mut self.sb, &self.paths, &self.watch, block, &mut self.journal).await {
-                Ok(true) => self.watch = watch_for(a, &self.paths, &self.sb),
-                Ok(false) => {}
-                Err(e) => warn!(error = %format!("{e:#}"), "aero: learner failed"),
-            }
-            let s = std::mem::take(&mut self.sb.stats);
-            info!(blocks = s.blocks, broken = s.broken, passes = s.passes, moved = s.moved, failed = s.failed, learned = self.sb.learned.len(), "aero: same-block stats");
-            writeln!(self.journal, "{}", json!({ "kind": "aero_same_block", "block": block, "stats": s, "learned": self.sb.learned.len() }))?;
-        }
         let cooling = exec.is_some_and(|e| e.halted());
-        if let Err(err) = tick(self.cfg, p, head, &self.new_ladder, &self.paths, exec, cooling, &mut self.state, &mut self.journal, &At::Sealed(BlockId::number(head.number)), &mut None).await {
+        if let Err(err) = tick(self.cfg, p, head, &self.new_ladder, &self.paths, exec, cooling, &mut self.state, &mut self.journal, BlockId::number(head.number)).await {
             warn!(error = %err, block, "aero: tick failed");
-        }
-        Ok(())
-    }
-
-    async fn on_flashblocks(&mut self, p: &P, first: Flashblock, rx: &mut mpsc::Receiver<Flashblock>, exec: Option<&ExecHandle>, last_block: u64) -> Result<()> {
-        let cooling = exec.is_some_and(|e| e.halted());
-        if let Err(err) = on_flashblocks(self.cfg, p, &mut self.sb, first, rx, &self.watch, &self.new_ladder, &self.paths, exec, cooling, last_block, &mut self.state, &mut self.journal).await {
-            warn!(error = %err, "aero: same-block pass failed");
         }
         Ok(())
     }
@@ -647,76 +330,10 @@ impl<P: Provider + Clone> OpportunitySource<P> for Aero<'_> {
 }
 
 /// Starts the Aero strategy and hands it to the generic driver (`runner::run`, which owns the
-/// heads / HTTP-polling / flashblocks scheduling). `fb` = Some enables same-block mode.
-pub async fn run<P: Provider + Clone + Send + Sync + 'static>(cfg: &Config, p: P, exec: Option<Executor<P>>, heads: tokio::sync::watch::Receiver<Option<Head>>, fb: Option<mpsc::Receiver<Flashblock>>) -> Result<()> {
-    let mut strategy = Aero::start(cfg, &p, exec.as_ref().map(|e| e.address), fb.is_some()).await?;
-    runner::run(&mut strategy, p, exec, heads, fb, RunnerOpts { poll_ms: cfg.aero.poll_ms, ws_quiet: WS_QUIET }).await
-}
-
-/// The flashblocks waiting (the first, then whatever queued behind it) are taken in; if they
-/// brought candidates for the in-progress block, the pass runs on it, once our head stream has
-/// the sealed base (index 0 of a block arrives before the nodes serve the one before it; until
-/// then the candidates wait). Candidates that touched no pool in the replay are dropped; if the
-/// replay itself failed they wait for the next flashblock, and a second failure breaks the block.
-#[allow(clippy::too_many_arguments)]
-async fn on_flashblocks<P: Provider + Clone>(
-    cfg: &Config,
-    p: &P,
-    sb: &mut SameBlock,
-    first: Flashblock,
-    rx: &mut mpsc::Receiver<Flashblock>,
-    watch: &Watch,
-    new_ladder: &[U256],
-    paths: &[Path],
-    exec: Option<&ExecHandle>,
-    cooling: bool,
-    last_block: u64,
-    state: &mut TickState,
-    journal: &mut std::fs::File,
-) -> Result<()> {
-    sb.absorb(first, watch);
-    while let Ok(m) = rx.try_recv() {
-        sb.absorb(m, watch);
-    }
-    let Some(pd) = sb.pending.as_mut() else { return Ok(()) };
-    // Nothing new, too late in the block to land in it (same_block_last_index: judged by the newest
-    // flashblock, i.e. now, since a send from here lands ~4-5 flashblocks after it whatever
-    // flashblock the trigger came in), base not in yet, already sealed (the per-head pass has it),
-    // or nothing to sell on.
-    if pd.broken || pd.fresh.is_empty() || pd.index > cfg.aero.same_block_last_index || pd.block != last_block + 1 || !paths.iter().any(|x| !x.buy) {
-        return Ok(());
-    }
-    let at = At::Pending(PendingAt {
-        base: pd.block - 1,
-        timestamp: pd.timestamp,
-        base_fee: pd.base_fee,
-        fresh: pd.prefix.len(),
-        prefix: pd.prefix.iter().chain(&pd.fresh).cloned().collect(),
-        index: pd.index,
-        seen: pd.seen,
-    });
-    // The pass quotes on top of base, for the in-progress block's base fee.
-    let head = Head { number: pd.block - 1, timestamp: pd.timestamp, base_fee: pd.base_fee, seen_at: pd.seen, source: heads::SOURCE_FLASHBLOCK };
-    let mut touched = None;
-    let r = tick(cfg, p, &head, new_ladder, paths, exec, cooling, state, journal, &at, &mut touched).await;
-    let At::Pending(pa) = at else { unreachable!() };
-    sb.stats.passes += 1;
-    // No flashblock was taken in during the pass, so `sb.pending` is still this block.
-    let Some(pd) = sb.pending.as_mut().filter(|pd| pd.block == pa.base + 1) else { return r };
-    match touched {
-        Some(t) => {
-            sb.stats.moved += u64::from(t[pa.fresh..].iter().any(|x| *x));
-            // Keep what moved a pool.
-            pd.prefix = pa.keep(&t).prefix;
-            pd.fresh.clear();
-        }
-        None => {
-            sb.stats.failed += 1;
-            pd.failures += 1;
-            pd.broken |= pd.failures >= 2;
-        }
-    }
-    r
+/// heads / HTTP-polling scheduling).
+pub async fn run<P: Provider + Clone + Send + Sync + 'static>(cfg: &Config, p: P, exec: Option<Executor<P>>, heads: tokio::sync::watch::Receiver<Option<Head>>) -> Result<()> {
+    let mut strategy = Aero::start(cfg, &p, exec.as_ref().map(|e| e.address)).await?;
+    runner::run(&mut strategy, p, exec, heads, RunnerOpts { poll_ms: cfg.aero.poll_ms, ws_quiet: WS_QUIET }).await
 }
 
 /// Startup reads must survive a busy endpoint (429s are common right at launch).
@@ -1112,10 +729,7 @@ fn steps(a: &AeroConfig, paths: &[Path], loan_token: Address, p: &Plan) -> (Vec<
 
 /// Quotes, all in one multicall eth_call: USD prices, V2 curves, and the CL curves through the
 /// GridQuoter (CL_PER_CALL pools per sub-call). Returns (usd per loan, curve per path).
-/// Also returns the number of the block the node simulated (Multicall3.getBlockNumber in the same
-/// call): on a "pending" base it tells the in-progress block from a stale one.
-/// On a pending block, last: which replayed txs touched our pools.
-async fn quote<P: Provider>(cfg: &Config, p: &P, paths: &[Path], loans: &[Vec<U256>], new_ladder: &[U256], quoter: &StateOverride, at: &At) -> Result<(Vec<Option<f64>>, Vec<Option<Curve>>, Option<u64>, Option<Vec<bool>>)> {
+async fn quote<P: Provider>(cfg: &Config, p: &P, paths: &[Path], loans: &[Vec<U256>], new_ladder: &[U256], quoter: &StateOverride, at: BlockId) -> Result<(Vec<Option<f64>>, Vec<Option<Curve>>)> {
     let a = &cfg.aero;
     let f = math::u256_f64;
     let mut calls: Vec<(Address, Bytes)> = vec![];
@@ -1171,11 +785,7 @@ async fn quote<P: Provider>(cfg: &Config, p: &P, paths: &[Path], loans: &[Vec<U2
         cl_idx.push(calls.len());
         calls.push((SIM_QUOTER, IGridQuoterA::quoteCall { paths: gpaths, amounts: amounts.clone() }.abi_encode().into()));
     }
-    let bn_idx = calls.len();
-    calls.push((crate::chain::MULTICALL3, IMulticall3A::getBlockNumberCall {}.abi_encode().into()));
-    let pools: HashSet<Address> = paths.iter().map(|x| x.venue.pool).collect();
-    let (r, touched) = multicall_ov(p, &calls, quoter, at, &pools).await?;
-    let simulated = r[bn_idx].as_ref().and_then(|b| IMulticall3A::getBlockNumberCall::abi_decode_returns(b).ok()).map(|n| n.to::<u64>());
+    let r = multicall_ov(p, &calls, quoter, at).await?;
     let cl_res: Vec<Result<Vec<Vec<U256>>>> = cl_idx
         .iter()
         .map(|i| {
@@ -1220,7 +830,7 @@ async fn quote<P: Provider>(cfg: &Config, p: &P, paths: &[Path], loans: &[Vec<U2
             Err(e) => warn!(error = %e, pools = members.len(), "aero: CL quotes failed"),
         }
     }
-    Ok((usd, curves, simulated, touched))
+    Ok((usd, curves))
 }
 
 /// (path index, curve) of one loan token's allowed, quoted paths on one side.
@@ -1244,8 +854,7 @@ async fn tick<P: Provider + Clone>(
     cooling: bool,
     state: &mut TickState,
     journal: &mut std::fs::File,
-    at: &At,
-    touched: &mut Option<Vec<bool>>,
+    at: BlockId,
 ) -> Result<()> {
     let a = &cfg.aero;
     let block = head.number;
@@ -1261,33 +870,11 @@ async fn tick<P: Provider + Clone>(
             (0..LOAN_STEPS).map(|k| U256::from((MIN_LOAN_USD * r.powi(k as i32) / usd * 10f64.powi(l.decimals as i32)) as u128)).collect()
         })
         .collect();
-    // The per-head pass quotes at the head itself (pinned by number, so every call of the pass and
-    // the exact check read the same state even across endpoints), right when it arrives. Measured: at
-    // that moment neither base-preconf's "latest" nor any endpoint's "pending" is ahead of the
-    // sealed head (the next block's flashblocks have not started), and base-preconf's "pending"
-    // even lags a block, so asking both only doubled the load. What moves the pools before our
-    // tx is the ~1-2 s of the next block ahead of it (the two reverts of 2026-10-22 landed at
-    // index 154 / 178): the same-block pass (At::Pending) quotes on that part of the block.
-    // `ahead` (simulated block - head) is journaled to keep an eye on it.
-    let state_label = at.label();
-    let (usd, curves, simulated, replay) = quote(cfg, p, paths, &loans, new_ladder, &state.quoter, at).await?;
-    *touched = replay;
-    // Same-block: the exact check replays only the txs that matter (the known prefix and the new
-    // candidates that touched a pool); none of them touched one -> same state as the last pass.
-    let kept;
-    let exact_at = match (at, touched.as_deref()) {
-        (At::Pending(pa), Some(t)) => {
-            if !t[pa.fresh.min(t.len())..].iter().any(|x| *x) {
-                return Ok(());
-            }
-            kept = At::Pending(pa.keep(t));
-            &kept
-        }
-        _ => at,
-    };
-    let ahead = simulated.map(|n| n as i64 - block as i64);
-    state.pending_hits += u64::from(ahead.is_some_and(|a| a >= 1));
-    state.quotes += 1;
+    // The pass quotes at the head itself, pinned by number, so every call of the pass and the exact
+    // check read the same state even across endpoints. Under Denim (200 ms blocks) what moves the
+    // pools before our tx is the next block; a spread is taken there.
+    let (usd, curves) = quote(cfg, p, paths, &loans, new_ladder, &state.quoter, at).await?;
+    let exact_at = at;
 
     for (li, u) in usd.iter().enumerate() {
         if let Some(u) = u.filter(|u| *u > 0.0) {
@@ -1349,8 +936,7 @@ async fn tick<P: Provider + Clone>(
                 journal,
                 "{}",
                 json!({ "kind": "aero_tick", "block": block, "loan": l.token, "buy_pools": buys.len(), "sell_pools": sells.len(), "p_old": p_old, "p_new": p_new, "spread_bps": spread_bps,
-                        "best_loan": lb.as_ref().map(|(pl, _)| pl.loan / dec), "est_profit_usd": est,
-                        "state": state_label, "fb": at.fb(), "ahead": ahead, "fresh_share": state.pending_hits as f64 / state.quotes.max(1) as f64 })
+                        "best_loan": lb.as_ref().map(|(pl, _)| pl.loan / dec), "est_profit_usd": est })
             )?;
         }
         if let Some((pl, e)) = lq
@@ -1366,7 +952,7 @@ async fn tick<P: Provider + Clone>(
         let leg = |(pi, u): &(usize, f64), d: f64| json!({ "venue": paths[*pi].venue.label(), "pool": paths[*pi].venue.pool, "in": u / d });
         json!({ "buy": pl.buy.iter().map(|x| leg(x, dec)).collect::<Vec<_>>(), "sell": pl.sell.iter().map(|x| leg(x, 1e18)).collect::<Vec<_>>() })
     };
-    info!(block, loan = best_plan.loan / dec, est_net_usd = est, buy_pools = best_plan.buy.len(), sell_pools = best_plan.sell.len(), state = state_label, fb = %at.fb(), "aero: OPPORTUNITY (estimate)");
+    info!(block, loan = best_plan.loan / dec, est_net_usd = est, buy_pools = best_plan.buy.len(), sell_pools = best_plan.sell.len(), "aero: OPPORTUNITY (estimate)");
     let Some(contract) = a.contract else {
         writeln!(journal, "{}", json!({ "kind": "aero_opp", "block": block, "loan": best_plan.loan / dec, "route": route(&best_plan), "est_profit_usd": est, "exact_usd": null }))?;
         return Ok(());
@@ -1426,14 +1012,14 @@ async fn tick<P: Provider + Clone>(
         .filter_map(|(r, (_, f, _))| r.as_ref().err().map(|e| format!("{}: {}", f.name(), e.to_string().chars().take(160).collect::<String>())))
         .collect();
     let Some(pk) = ae.pick(&cands, &exact, usd) else {
-        writeln!(journal, "{}", json!({ "kind": "aero_opp", "block": block, "loan": best_plan.loan / dec, "route": route(&best_plan), "est_profit_usd": est, "exact_usd": null, "errors": errors, "state": state_label, "fb": at.fb() }))?;
+        writeln!(journal, "{}", json!({ "kind": "aero_opp", "block": block, "loan": best_plan.loan / dec, "route": route(&best_plan), "est_profit_usd": est, "exact_usd": null, "errors": errors }))?;
         return Ok(());
     };
     let (pi, source, amt) = built[pk.index];
     let (c, funder) = (&cands[pk.index], source.name());
     let (profit_usd, net_usd) = (pk.gross_usd, pk.net_usd);
-    info!(block, loan = units(amt, l.decimals), profit_usd, net_usd, funding = funder, state = state_label, fb = %at.fb(), "aero: exact check");
-    writeln!(journal, "{}", json!({ "kind": "aero_opp", "block": block, "loan": units(amt, l.decimals), "route": route(&plans[pi]), "est_profit_usd": est, "exact_usd": profit_usd, "gas_usd": profit_usd - net_usd, "net_usd": net_usd, "funding": funder, "cooling": cooling, "state": state_label, "fb": at.fb(), "ahead": ahead }))?;
+    info!(block, loan = units(amt, l.decimals), profit_usd, net_usd, funding = funder, "aero: exact check");
+    writeln!(journal, "{}", json!({ "kind": "aero_opp", "block": block, "loan": units(amt, l.decimals), "route": route(&plans[pi]), "est_profit_usd": est, "exact_usd": profit_usd, "gas_usd": profit_usd - net_usd, "net_usd": net_usd, "funding": funder, "cooling": cooling }))?;
     if net_usd < c.floor_usd {
         info!(block, net_usd, need = c.floor_usd, "aero: exact net below the floor; not sending");
         return Ok(());
@@ -1457,8 +1043,8 @@ async fn tick<P: Provider + Clone>(
     match ae.send(e, c, &t, gates, block, deadline).await {
         Ok(None) => {}
         Ok(Some(inf)) => {
-            warn!(tx = %inf.hash, profit_usd, net_usd, priority_gwei = t.priority_fee_wei as f64 / 1e9, bid_usd = t.bid_usd, state = state_label, fb = %at.fb(), "aero: SENT");
-            writeln!(journal, "{}", json!({ "kind": "aero_sent", "block": block, "tx": inf, "loan": units(amt, l.decimals), "route": route(&plans[pi]), "exact_usd": profit_usd, "net_usd": net_usd, "funding": funder, "priority_fee_wei": t.priority_fee_wei, "bid_usd": t.bid_usd, "state": state_label, "fb": at.fb() }))?;
+            warn!(tx = %inf.hash, profit_usd, net_usd, priority_gwei = t.priority_fee_wei as f64 / 1e9, bid_usd = t.bid_usd, "aero: SENT");
+            writeln!(journal, "{}", json!({ "kind": "aero_sent", "block": block, "tx": inf, "loan": units(amt, l.decimals), "route": route(&plans[pi]), "exact_usd": profit_usd, "net_usd": net_usd, "funding": funder, "priority_fee_wei": t.priority_fee_wei, "bid_usd": t.bid_usd }))?;
         }
         Err(err) => warn!(error = %err, "aero: send failed"),
     }
@@ -1580,111 +1166,6 @@ mod tests {
         assert_eq!((b.base_priority_wei, b.min_profit_usd, b.share, b.max_priority_wei), (7, 2.0, 0.25, 9));
     }
 
-    #[test]
-    fn watch_catches_to_abi_words_and_packed_calldata() {
-        let w = Watch::new([POOL], []);
-        let other = Address::repeat_byte(7);
-        assert!(w.hit(Some(POOL), &[]), "a direct call");
-        let abi = [&[0u8; 4][..], &[0u8; 12], POOL.as_slice()].concat();
-        assert!(w.hit(Some(other), &abi), "an ABI word");
-        let packed = [&[1u8, 2, 3][..], POOL.as_slice(), &[9u8; 5]].concat();
-        assert!(w.hit(Some(other), &packed), "packed at an odd offset");
-        assert!(!w.hit(Some(other), &[&[0u8; 12][..], other.as_slice()].concat()));
-        assert!(!w.hit(None, &POOL.as_slice()[..19]), "a cut-off address is not one");
-    }
-
-    #[test]
-    fn a_call_straight_to_a_token_is_no_candidate_but_a_route_through_it_is() {
-        let token = Address::repeat_byte(0x33);
-        let w = Watch::new([POOL], [token]);
-        let router = Address::repeat_byte(7);
-        let names_token = [&[0u8; 16][..], token.as_slice()].concat();
-        assert!(!w.hit(Some(token), &names_token), "transfer / approve on the token itself");
-        assert!(w.hit(Some(router), &names_token), "a router path through the token");
-    }
-
-    #[test]
-    fn the_exact_check_replays_the_known_prefix_and_only_the_new_txs_that_moved_a_pool() {
-        let tx = |n: u64| TransactionRequest::default().gas_limit(n);
-        let pa = PendingAt { base: 9, timestamp: 1, base_fee: 2, prefix: (0..4).map(tx).collect(), fresh: 2, index: 3, seen: Instant::now() };
-        let k = pa.keep(&[false, false, false, true]);
-        assert_eq!(k.prefix.iter().map(|t| t.gas.unwrap()).collect::<Vec<_>>(), vec![0, 1, 3], "known prefix kept whatever its replay logged");
-        assert_eq!((k.fresh, k.base, k.index), (3, 9, 3));
-    }
-
-    #[test]
-    fn the_learner_takes_bots_not_hubs_and_forgets_them() {
-        let (bot, busy_bot, hub) = (Address::repeat_byte(0xb0), Address::repeat_byte(0xb1), Address::repeat_byte(0x4a));
-        let w = Watch::new([POOL], []);
-        let mut sb = SameBlock::default();
-        let h = |i: u8| B256::repeat_byte(i);
-        // bot: 2 txs, both on our pools. busy_bot: 40 small txs, 2 on our pools (cheap to replay).
-        // hub: 40 big txs, 2 on our pools (5% < 1 / LEARN_SHARE, ~4 KB per block of replay).
-        sb.recent_to.insert(h(1), (bot, 100, false, 300));
-        sb.recent_to.insert(h(2), (bot, 101, false, 300));
-        for i in 0..40u8 {
-            sb.recent_to.insert(h(100 + i), (busy_bot, 100 + u64::from(i % 30), false, 98));
-            sb.recent_to.insert(h(150 + i), (hub, 100 + u64::from(i % 30), false, 3000));
-        }
-        sb.recent_to.insert(h(30), (Address::repeat_byte(7), 100, true, 100));
-        let pool_txs: HashSet<B256> = [h(1), h(2), h(100), h(101), h(150), h(151), h(30)].into();
-        let mut out = sb.learn_from(&pool_txs, &w, 100, 129);
-        out.sort();
-        let mut want = vec![(bot, 2, 2, true), (busy_bot, 2, 40, true), (hub, 2, 40, false)];
-        want.sort();
-        assert_eq!(out, want);
-        let mut learned: Vec<Address> = sb.learned.keys().copied().collect();
-        learned.sort();
-        assert_eq!(learned, vec![bot, busy_bot], "a tx the watch caught teaches nothing");
-        // Trading again refreshes it; silence for LEARN_EXPIRE blocks drops it.
-        sb.learn_from(&[h(2)].into(), &w, 130, 150);
-        assert_eq!(sb.learned[&bot], 150);
-        sb.learn_from(&HashSet::new(), &w, 151, 129 + LEARN_EXPIRE + 1);
-        assert_eq!(sb.learned.keys().copied().collect::<Vec<_>>(), vec![bot]);
-        sb.learn_from(&HashSet::new(), &w, 151, 150 + LEARN_EXPIRE + 1);
-        assert!(sb.learned.is_empty());
-    }
-
-    fn signed(to: Address, input: Vec<u8>) -> (Bytes, Address) {
-        use alloy::{
-            consensus::{SignableTransaction, TxEip1559},
-            eips::eip2718::Encodable2718,
-            network::TxSignerSync,
-            signers::local::PrivateKeySigner,
-        };
-        let s = PrivateKeySigner::random();
-        let mut tx = TxEip1559 { chain_id: 8453, nonce: 7, gas_limit: 300_000, max_fee_per_gas: 2, max_priority_fee_per_gas: 1, to: to.into(), input: input.into(), ..Default::default() };
-        let sig = s.sign_transaction_sync(&mut tx).unwrap();
-        (TxEnvelope::from(tx.into_signed(sig)).encoded_2718().into(), s.address())
-    }
-
-    fn fb(block: u64, index: u64, txs: Vec<Bytes>) -> Flashblock {
-        let open = index == 0;
-        Flashblock { block, index, txs, timestamp: open.then_some(1_700_000_000), base_fee: open.then_some(6_000_000), seen: Instant::now() }
-    }
-
-    #[test]
-    fn flashblocks_collect_candidates_in_order_and_a_gap_breaks_the_block() {
-        let w = Watch::new([POOL], []);
-        let router = Address::repeat_byte(9);
-        let (hit, from) = signed(router, [&[0u8; 16][..], POOL.as_slice()].concat());
-        let (miss, _) = signed(router, vec![1, 2, 3]);
-        let mut sb = SameBlock::default();
-        sb.absorb(fb(100, 1, vec![hit.clone()]), &w);
-        assert!(sb.pending.is_none(), "a block is only followed from its index 0");
-        sb.absorb(fb(101, 0, vec![]), &w);
-        sb.absorb(fb(101, 1, vec![miss.clone(), hit.clone()]), &w);
-        let pd = sb.pending.as_ref().unwrap();
-        assert_eq!((pd.block, pd.timestamp, pd.base_fee, pd.broken), (101, 1_700_000_000, 6_000_000, false));
-        assert_eq!(pd.fresh.len(), 1);
-        assert_eq!((pd.fresh[0].from, pd.fresh[0].to, pd.fresh[0].nonce), (Some(from), Some(router.into()), None), "sender recovered, nonce left to the node");
-        assert_eq!(sb.recent_to.len(), 2, "every streamed tx is kept for the learner");
-        assert!(sb.recent_to.get(&keccak256(&hit)).unwrap().2 && !sb.recent_to.get(&keccak256(&miss)).unwrap().2);
-        sb.absorb(fb(101, 3, vec![]), &w);
-        assert!(sb.pending.as_ref().unwrap().broken, "index 2 never came");
-        sb.absorb(fb(102, 0, vec![]), &w);
-        assert!(!sb.pending.as_ref().unwrap().broken && sb.pending.as_ref().unwrap().fresh.is_empty(), "the next block starts clean");
-    }
 }
 
 #[cfg(test)]
@@ -1699,6 +1180,7 @@ mod e2e {
     use alloy::{
         network::{EthereumWallet, TransactionBuilder},
         node_bindings::Anvil,
+        primitives::B256,
         providers::{ProviderBuilder, ext::AnvilApi},
         signers::local::PrivateKeySigner,
     };

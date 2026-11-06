@@ -3,7 +3,7 @@
 [繁體中文](README.zh-TW.md)
 
 A framework for building atomic on-chain **arbitrage bots** in Rust ([alloy](https://github.com/alloy-rs/alloy))
-and Solidity ([Foundry](https://getfoundry.sh)). The block / flashblock loop, RPC pool, transaction
+and Solidity ([Foundry](https://getfoundry.sh)). The block loop, RPC pool, transaction
 sending and the choice of transient capital are generic; a strategy plugs in through a trait, and
 any trade it can write as steps runs on one generic contract (`StepArb.sol`).
 **Aero merger arbitrage on Base** (old AERO converts 1:1 into new AERO: buy old, migrate, sell new,
@@ -18,7 +18,7 @@ shared with [Debt-keeper](https://github.com/foodpenguin/Debt-keeper). This crat
 ## What you get
 
 - **Generic strategy driver** (`runner::run` + `OpportunitySource`): new heads over WebSocket with
-  HTTP polling while WS is quiet, batches of Base flashblocks for same-block work, the executor as
+  HTTP polling while WS is quiet, the executor as
   its own task (receipts polled in the background, settled txs handed to the strategy), gas
   accounting.
 - **Generic send pipeline** (`arb_exec::ArbExecutor`): exact check of every candidate against the
@@ -42,7 +42,7 @@ shared with [Debt-keeper](https://github.com/foodpenguin/Debt-keeper). This crat
   "morpho" | "v4" | "auto"`.
 - **Aero example**: pool discovery from factories and a registry, batched grid quoting by state
   override (`GridQuoter`), greedy split across V2 and CL pools, exact check of the real transaction
-  before sending, optional same-block mode that replays the in-progress block's relevant txs.
+  before sending, one pass per sealed head.
 - **Execution plumbing** (`onchain-core`): multi-endpoint RPC pool, a versioned nonce file shared by
   bots on one hot wallet, failure cooldown, warm broadcast connections, kill switch.
 
@@ -98,8 +98,8 @@ cargo build --release
 
 ## Extending
 
-- **Another strategy**: implement `runner::OpportunitySource` (`on_block`, `on_flashblocks`,
-  `on_outcome`), then call `runner::run`. Return `Err` from a hook only for fatal errors. Write the
+- **Another strategy**: implement `runner::OpportunitySource` (`on_block`, `on_outcome`), then call
+  `runner::run`. Return `Err` from a hook only for fatal errors. Write the
   trade as `ArbStep`s for `StepArb` (`step_arb::calldata`), and send through
   `arb_exec::ArbExecutor` (build `Candidate`s, supply `call` and a USD valuation), as Aero does.
 - **Another capital source**: implement `FlashLoan` or `FlashAccounting`, and give the contract an

@@ -1,6 +1,6 @@
-//! Config for the arbitrage bot: RPC endpoints, the hot-wallet executor, the flashblocks stream and
-//! the strategies' own sections (`[aero]`). Only what the arb code reads lives here, so a config for
-//! a new chain needs no liquidation-era keys.
+//! Config for the arbitrage bot: RPC endpoints, the hot-wallet executor and the strategies' own
+//! sections (`[aero]`). Only what the arb code reads lives here, so a config for a new chain needs
+//! no liquidation-era keys.
 
 use alloy::primitives::Address;
 use anyhow::{Context, Result};
@@ -17,8 +17,6 @@ pub struct Config {
     pub exec: ExecConfig,
     #[serde(default)]
     pub router: RouterConfig,
-    #[serde(default)]
-    pub flashblocks: FlashblocksConfig,
     #[serde(default)]
     pub aero: AeroConfig,
 }
@@ -108,16 +106,6 @@ pub struct AeroConfig {
     /// Keeps its per-block quotes off endpoints another bot sharing the same keys depends on.
     #[serde(default)]
     pub rpc: Vec<String>,
-    /// Same-block mode: also quote (and send) on the in-progress block, from the flashblocks stream
-    /// ([flashblocks] ws), replaying its txs that move our pools (aero.rs `At::Pending`). Until
-    /// Denim; without the stream only the per-head path runs.
-    #[serde(default)]
-    pub same_block: bool,
-    /// Same-block passes only for flashblocks up to this index: a send lands some flashblocks after
-    /// its trigger (how many depends on your latency to the sequencer), so a later one can only
-    /// reach the next block, where the per-head pass already is. Measure it from your host.
-    #[serde(default = "default_aero_last_fb")]
-    pub same_block_last_index: u64,
     /// Bidding for big arbs: when the exact profit is at least bid_min_profit_usd, up to bid_share
     /// of it goes into the priority fee (capped at bid_max_priority_wei, and never below the
     /// floor's net). Aero pools tax priority fees (MEV tax multiplier): check it before raising the
@@ -190,9 +178,6 @@ fn default_aero_min_profit() -> f64 {
 fn default_aero_min_bps() -> f64 {
     20.0
 }
-fn default_aero_last_fb() -> u64 {
-    6
-}
 fn default_aero_bid_min() -> f64 {
     10.0
 }
@@ -244,21 +229,6 @@ fn default_quoter_artifact() -> String {
     "../contracts/out/GridQuoter.sol/GridQuoter.json".into()
 }
 
-#[derive(Debug, Deserialize, Clone)]
-pub struct FlashblocksConfig {
-    /// Flashblocks stream (brotli-compressed JSON over WebSocket), for same-block strategies.
-    #[serde(default = "default_fb_ws")]
-    pub ws: String,
-}
-impl Default for FlashblocksConfig {
-    fn default() -> Self {
-        Self { ws: default_fb_ws() }
-    }
-}
-fn default_fb_ws() -> String {
-    "wss://mainnet.flashblocks.base.org/ws".into()
-}
-
 fn default_usd_feed_age() -> u64 {
     3600
 }
@@ -300,7 +270,6 @@ mod tests {
         let cfg: Config = toml::from_str(MINIMAL).unwrap();
         assert_eq!(cfg.chain_id, 8453);
         assert_eq!(cfg.router.quoter_artifact, default_quoter_artifact());
-        assert_eq!(cfg.flashblocks.ws, default_fb_ws());
     }
 
     #[test]
