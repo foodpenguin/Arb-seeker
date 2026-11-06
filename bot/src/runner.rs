@@ -2,7 +2,6 @@
 //!
 //! - the new-block signal: WS newHeads (heads::spawn_ws_many); when it is quiet for `ws_quiet`,
 //!   HTTP polling every `poll_ms` takes over until WS speaks again;
-//! - the flashblocks stream (same-block mode), handed to the strategy in batches;
 //! - the executor as its own task (`onchain_core::actor`): it polls receipts on every head the
 //!   driver sees, and each settled tx reaches the strategy's `on_outcome` with the gas spent so
 //!   far, without the block loop ever waiting for a receipt.
@@ -20,7 +19,6 @@ use tracing::{info, warn};
 use crate::{
     actor::{self, ExecHandle, Settled},
     executor::{Executor, Inflight, Outcome},
-    flashblocks::Flashblock,
     heads::{Head, http_head},
 };
 
@@ -31,10 +29,6 @@ pub trait OpportunitySource<P: Provider + Clone> {
 
     /// A new sealed head (deduplicated, strictly increasing). `exec` is `None` in observe-only mode.
     fn on_block(&mut self, p: &P, head: &Head, exec: Option<&ExecHandle>) -> impl Future<Output = Result<()>> + Send;
-
-    /// Flashblocks of the in-progress block: `first`, plus whatever is queued behind it in `rx`.
-    /// `last_block` is the latest sealed head the driver has seen.
-    fn on_flashblocks(&mut self, p: &P, first: Flashblock, rx: &mut mpsc::Receiver<Flashblock>, exec: Option<&ExecHandle>, last_block: u64) -> impl Future<Output = Result<()>> + Send;
 
     /// The tx in flight resolved (included, reverted, dropped or expired). `gas_spent_total_wei`
     /// counts every included tx so far; `cooldown_started` is true when this outcome put the
@@ -57,7 +51,6 @@ pub async fn run<P: Provider + Clone + Send + Sync + 'static, S: OpportunitySour
     p: P,
     exec: Option<Executor<P>>,
     mut heads: watch::Receiver<Option<Head>>,
-    mut fb: Option<mpsc::Receiver<Flashblock>>,
     opts: RunnerOpts,
 ) -> Result<()> {
     let name = strategy.name();
@@ -75,9 +68,8 @@ pub async fn run<P: Provider + Clone + Send + Sync + 'static, S: OpportunitySour
     let mut quiet_at = tokio::time::Instant::now() + opts.ws_quiet;
     let mut next_poll = tokio::time::Instant::now();
     loop {
-        // Heads first, then the timers (ready only when due), then flashblocks: a same-block pass
-        // takes longer than the 200 ms between flashblocks, so one is nearly always waiting, and
-        // ahead of the timers it would keep the quiet switch and the HTTP poll from ever firing.
+        // Heads first, then the timers (ready only when due): the quiet switch and the HTTP poll
+        // fire only when no WS head has arrived.
         let head = tokio::select! {
             biased;
             r = heads.changed(), if heads_open => {
@@ -110,11 +102,6 @@ pub async fn run<P: Provider + Clone + Send + Sync + 'static, S: OpportunitySour
             }
             Some(s) = next_settled(&mut settled) => {
                 deliver(strategy, s, last_block, &mut gas_spent_wei)?;
-                continue;
-            }
-            Some(first) = next_fb(&mut fb) => {
-                let rx = fb.as_mut().expect("a flashblock came from it");
-                strategy.on_flashblocks(&p, first, rx, exec.as_ref(), last_block).await?;
                 continue;
             }
         };
@@ -158,13 +145,6 @@ async fn next_settled(rx: &mut Option<mpsc::UnboundedReceiver<Settled>>) -> Opti
     }
 }
 
-async fn next_fb(rx: &mut Option<mpsc::Receiver<Flashblock>>) -> Option<Flashblock> {
-    match rx {
-        Some(r) => r.recv().await,
-        None => std::future::pending().await,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::Instant;
@@ -176,7 +156,6 @@ mod tests {
     #[derive(Debug, PartialEq)]
     enum Ev {
         Block(u64),
-        Flash { block: u64, index: u64, last_block: u64 },
     }
 
     /// Records what the driver hands it and signals each event; a fatal error on `stop_at` ends
@@ -197,11 +176,6 @@ mod tests {
             anyhow::ensure!(head.number != self.stop_at, "stop");
             Ok(())
         }
-        async fn on_flashblocks(&mut self, _p: &P, first: Flashblock, _rx: &mut mpsc::Receiver<Flashblock>, _exec: Option<&ExecHandle>, last_block: u64) -> Result<()> {
-            self.seen.push(Ev::Flash { block: first.block, index: first.index, last_block });
-            let _ = self.signal.send(());
-            Ok(())
-        }
         fn on_outcome(&mut self, _block: u64, _inflight: &Inflight, _outcome: &Outcome, _gas: U256, _cooldown: bool) -> Result<()> {
             Ok(())
         }
@@ -212,11 +186,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn driver_dedupes_heads_feeds_flashblocks_and_stops_on_fatal_error() {
+    async fn driver_dedupes_heads_and_stops_on_fatal_error() {
         // Never contacted: WS "heads" never go quiet within the test, so no HTTP polling.
         let provider = ProviderBuilder::new().connect_http("http://127.0.0.1:1".parse().unwrap());
         let (htx, hrx) = watch::channel(None);
-        let (ftx, frx) = mpsc::channel(8);
         let (sig_tx, mut sig) = mpsc::unbounded_channel();
         let probe = Probe { seen: vec![], stop_at: 7, signal: sig_tx };
         let opts = RunnerOpts { poll_ms: 50, ws_quiet: Duration::from_secs(60) };
@@ -224,22 +197,19 @@ mod tests {
         // can run several strategies side by side.
         let driver = tokio::spawn(async move {
             let mut probe = probe;
-            let r = run(&mut probe, provider, None, hrx, Some(frx), opts).await;
+            let r = run(&mut probe, provider, None, hrx, opts).await;
             (probe, r)
         });
         htx.send(head(5)).unwrap();
         sig.recv().await.unwrap(); // Block(5) handled
-        // A repeat and an older head: both skipped. Heads are polled before flashblocks, so they
-        // are consumed before the flashblock below, whatever the scheduling.
+        // A repeat and an older head: both skipped.
         htx.send(head(5)).unwrap();
         htx.send(head(3)).unwrap();
-        ftx.send(Flashblock { block: 6, index: 1, txs: vec![], timestamp: None, base_fee: None, seen: Instant::now() }).await.unwrap();
-        sig.recv().await.unwrap(); // Flash handled
         htx.send(head(7)).unwrap();
         let (probe, r) = tokio::time::timeout(Duration::from_secs(10), driver).await.expect("driver stops").unwrap();
         let err = r.unwrap_err();
         assert!(err.to_string().contains("stop"), "{err}");
-        assert_eq!(probe.seen, vec![Ev::Block(5), Ev::Flash { block: 6, index: 1, last_block: 5 }, Ev::Block(7)]);
-        drop((htx, ftx));
+        assert_eq!(probe.seen, vec![Ev::Block(5), Ev::Block(7)]);
+        drop(htx);
     }
 }

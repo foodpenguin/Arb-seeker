@@ -3,7 +3,7 @@
 [English](README.md)
 
 用 Rust（[alloy](https://github.com/alloy-rs/alloy)）和 Solidity（[Foundry](https://getfoundry.sh)）
-開發原子性鏈上**套利 bot** 的框架。區塊／flashblock 迴圈、RPC 池、送單，以及暫時性資金的選擇都是
+開發原子性鏈上**套利 bot** 的框架。區塊迴圈、RPC 池、送單，以及暫時性資金的選擇都是
 通用的；策略透過 trait 接上，而任何能寫成一串步驟的交易，都能在同一個通用合約（`StepArb.sol`）上
 執行。範例策略是 **Base 上的 Aero 合併套利**（舊 AERO 可以 1:1 換成新 AERO：在同一筆交易裡買舊的、
 遷移、賣新的、還款，不需要自有資金）。鏈的基礎管線來自
@@ -16,7 +16,7 @@
 ## 功能
 
 - **通用策略驅動器**（`runner::run` + `OpportunitySource`）：用 WebSocket 收新區塊，WS 沒動靜時改用
-  HTTP 輪詢；Base flashblocks 批次供同區塊策略使用；executor 作為獨立的 task（receipt 在背景輪詢，
+  HTTP 輪詢；executor 作為獨立的 task（receipt 在背景輪詢，
   已結算的交易交給策略）；gas 記帳。
 - **通用送單流程**（`arb_exec::ArbExecutor`）：所有候選平行地對合約精確檢查、挑選（先看門檻，再看
   淨利）、可選的 priority fee 出價（在它自己的 priority 下重新檢查）、熱錢包付得起的送單條件，以及
@@ -35,8 +35,7 @@
   本體（內建遷移）；同一個套利也能在 `StepArb` 上執行（`[aero] contract_kind = "steps"`）。
   `[aero] funding = "morpho" | "v4" | "auto"`。
 - **Aero 範例**：從 factory 和 registry 找池子、用 state override 批次網格報價（`GridQuoter`）、
-  在 V2 和 CL 池之間貪婪拆單、送出前精算實際交易，以及可選的同區塊模式（重播進行中區塊裡相關的
-  交易）。
+  在 V2 和 CL 池之間貪婪拆單、送出前精算實際交易，每個封裝好的 head 跑一次。
 - **執行管線**（`onchain-core`）：多端點 RPC 池、共用同一個熱錢包的 bot 之間共用的版本化 nonce 檔、
   失敗冷卻、預熱的廣播連線、緊急停止開關。
 
@@ -89,7 +88,7 @@ cargo build --release
 
 ## 擴充
 
-- **其他策略**：實作 `runner::OpportunitySource`（`on_block`、`on_flashblocks`、`on_outcome`），
+- **其他策略**：實作 `runner::OpportunitySource`（`on_block`、`on_outcome`），
   再呼叫 `runner::run`。hook 只有遇到致命錯誤才回傳 `Err`。把交易寫成給 `StepArb` 用的 `ArbStep`
   （`step_arb::calldata`），送單和 Aero 一樣透過 `arb_exec::ArbExecutor`（建好 `Candidate`，提供
   `call` 和 USD 換算）。

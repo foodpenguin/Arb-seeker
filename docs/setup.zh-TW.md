@@ -30,7 +30,7 @@ cd contracts && forge build && cd ..        # bot 報價時會注入編譯好的
 cp .env.example .env    # 再填入你真正的 URL（這個檔案已被 gitignore）
 ```
 
-RPC URL 含有 API key，所以只放在 `.env`。設定檔裡每個 `[[rpc]]` 用 `http_env` 指向變數名稱（公共端點可以直接用 `http`）；log 和錯誤訊息只會出現端點的 `name`。`[aero] rpc` 可以讓策略依嚴格順序只用自己的端點，避免和同一組 key 上的其他 bot 搶額度。同塊模式需要支援 `eth_simulateV1` 的端點。
+RPC URL 含有 API key，所以只放在 `.env`。設定檔裡每個 `[[rpc]]` 用 `http_env` 指向變數名稱（公共端點可以直接用 `http`）；log 和錯誤訊息只會出現端點的 `name`。`[aero] rpc` 可以讓策略依嚴格順序只用自己的端點，避免和同一組 key 上的其他 bot 搶額度。
 
 ## 4. 設定檔
 
@@ -39,7 +39,7 @@ cd bot
 cp config.example.toml config.local.toml   # 已被 gitignore
 ```
 
-檢查 `[[rpc]]`、`[exec]`（只放熱錢包的地址，絕不放私鑰）、`[flashblocks]` 和 `[aero]`：Aero／舊 Aerodrome 的地址（要在鏈上核對；協議遷移時地址會改變）、`loan_tokens`、利潤門檻、priority fee、`funding`，以及部署後的 `contract`。範例裡的數值只是讓 bot 能啟動的佔位值，不是建議：請依自己的風險決定規模和出價。
+檢查 `[[rpc]]`、`[exec]`（只放熱錢包的地址，絕不放私鑰）和 `[aero]`：Aero／舊 Aerodrome 的地址（要在鏈上核對；協議遷移時地址會改變）、`loan_tokens`、利潤門檻、priority fee、`funding`，以及部署後的 `contract`。範例裡的數值只是讓 bot 能啟動的佔位值，不是建議：請依自己的風險決定規模和出價。
 
 - 不是 USD 穩定幣的借款代幣需要價格來源：`usd_feed`（Chainlink 的 USD feed，優先使用；範例用 Base 的 ETH/USD feed 為 WETH 計價）或 `usd_pool`。
 - 實跑前 `[exec] mode` 維持 `"shadow"`；`[exec] daily_gas_budget_usd` 限制 revert 套利每個 UTC 日能燒掉的 gas。

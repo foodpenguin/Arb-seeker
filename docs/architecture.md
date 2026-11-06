@@ -4,15 +4,14 @@
 
 This framework builds atomic on-chain arbitrage bots: detect a price gap, plan a bundle of swaps,
 fund it with transient capital (a flash loan or flash accounting), check it exactly against the
-contract, send it. The reusable plumbing (block/flashblock driver, send pipeline, the generic
-`StepArb` contract) is generic; a strategy plugs in through `OpportunitySource`, and funding
-sources through `FlashLoan` / `FlashAccounting`. **Aero merger arbitrage on Base** is the first,
-complete strategy.
+contract, send it. The reusable plumbing (block driver, send pipeline, the generic `StepArb`
+contract) is generic; a strategy plugs in through `OpportunitySource`, and funding sources through
+`FlashLoan` / `FlashAccounting`. **Aero merger arbitrage on Base** is the first, complete strategy.
 
 The crate is a library (`arbitrage_framework`, `bot/src/lib.rs`) plus the Aero bot binary. The
-chain plumbing (RPC pool, heads, Flashblocks stream, executor and its task, send gates, simulation,
-the shared config sections) is the `onchain-core` crate (repository bot-onchain-core, a git
-dependency pinned to a tag), shared with Debt-keeper and re-exported under its usual module names.
+chain plumbing (RPC pool, heads, executor and its task, send gates, simulation, the shared config
+sections) is the `onchain-core` crate (repository bot-onchain-core, a git dependency pinned to a
+tag), shared with Debt-keeper and re-exported under its usual module names.
 
 ## The driver: `runner::run` + `OpportunitySource` (`bot/src/runner.rs`)
 
@@ -20,15 +19,13 @@ dependency pinned to a tag), shared with Debt-keeper and re-exported under its u
 pub trait OpportunitySource<P> {
     fn name(&self) -> &'static str;
     fn on_block(&mut self, p: &P, head: &Head, exec: Option<&ExecHandle>) -> impl Future<Output = Result<()>> + Send;
-    fn on_flashblocks(&mut self, p: &P, first: Flashblock, rx: &mut mpsc::Receiver<Flashblock>,
-                      exec: Option<&ExecHandle>, last_block: u64) -> impl Future<Output = Result<()>> + Send;
     fn on_outcome(&mut self, block: u64, inflight: &Inflight, outcome: &Outcome,
                   gas_spent_total_wei: U256, cooldown_started: bool) -> Result<()>;
 }
 ```
 
-`runner::run(&mut strategy, provider, executor, heads, flashblocks, RunnerOpts { poll_ms, ws_quiet })`
-owns the scheduling:
+`runner::run(&mut strategy, provider, executor, heads, RunnerOpts { poll_ms, ws_quiet })` owns the
+scheduling:
 
 - new heads from WebSocket `newHeads` (several endpoints), deduplicated and strictly increasing;
   HTTP polling every `poll_ms` while WS has been quiet for `ws_quiet`;
@@ -37,9 +34,10 @@ owns the scheduling:
   gas accounting and whether it started the failure cooldown) through the driver loop; then
   `on_block` per head, after waiting briefly (`wait_polled`, at most `RECEIPT_WAIT`) for that
   head's receipt poll and delivering what it settled to `on_outcome`, so a tx included in it no
-  longer counts as in flight and its books (e.g. the budget reservation) are settled first. A strategy sends through the `ExecHandle` it is handed;
-- flashblocks batches (the first one plus whatever queued behind it) -> `on_flashblocks`, when the
-  strategy runs a same-block mode.
+  longer counts as in flight and its books (e.g. the budget reservation) are settled first. A strategy sends through the `ExecHandle` it is handed.
+
+Base Denim removed Flashblocks and the in-progress ("pending") state, so the driver has no
+same-block path; at 200 ms blocks `on_block` per sealed head is the trigger.
 
 A hook returns `Err` only for fatal errors (the driver stops); recoverable errors are logged and
 swallowed inside the strategy. `exec` is `None` in observe-only mode.
@@ -149,8 +147,8 @@ balance of `tokenIn`.
 What happens between "a strategy found an opportunity" and "a transaction is sent", for any atomic
 arb contract that returns its profit. The strategy builds one `Candidate { calldata, gas_est,
 floor_usd, l1_usd }` per way of taking the opportunity, in order of preference, and supplies two things: how
-to call (`call`: a closure running a `TransactionRequest` on the state it priced, e.g. the sealed
-head or a replayed in-progress block) and how to value the profit token in USD.
+to call (`call`: a closure running a `TransactionRequest` on the state it priced, i.e. the sealed
+head) and how to value the profit token in USD.
 
 1. `exact(candidates, call)`: every candidate runs against the contract in parallel, priced like
    the real tx (base priority fee, gas limit, max fee = 2 x base fee + priority), because venues may
@@ -209,8 +207,8 @@ Aerodrome V2 and Slipstream pools) -> migrate -> sell new AERO (split over Aero 
   The estimate subtracts the cheapest enabled source's flash fee and modelled gas.
 - **Exact check and send** go through `ArbExecutor`: one `Candidate` per size (the best size and its
   neighbours, re-split each) x enabled funding source, Morpho first so it keeps exact ties, each
-  with its own modelled gas (`arb_gas`) and the loan-size floor. `call` runs on the sealed head or,
-  in same-block mode, on the replayed in-progress block. The L1 data fee (one read for the largest
+  with its own modelled gas (`arb_gas`) and the loan-size floor. `call` runs on the sealed head. The
+  L1 data fee (one read for the largest
   calldata, alongside the exact calls) is counted in every candidate's net. Only an exact result is
   sent, with `minProfit = exact x min_profit_keep`, and the deadline is `[aero] deadline_secs`
   converted with the block time measured from the heads.
@@ -234,18 +232,15 @@ Aerodrome V2 and Slipstream pools) -> migrate -> sell new AERO (split over Aero 
   contract whose `PROFIT_RECEIVER` is the hot wallet.
 - **Live mode** needs both `[exec] mode = "live"` in the config and `--live` on the command line
   (neither a stray flag nor a copied config sends alone), plus `exec.keystore` and `[aero] contract`.
-- **Same-block mode** (`[aero] same_block`, Base Flashblocks): the same pass runs on the
-  in-progress block whenever its flashblocks carry txs that may move our pools; those txs are
-  replayed on the sealed head ahead of the quotes and the exact check, so a gap opened early in a
-  block can be taken in that block. A learner keeps track of which tx targets actually touch our
-  pools, so unrelated traffic does not trigger passes.
+- **No same-block mode:** Base Denim removed Flashblocks and the in-progress ("pending") state, so
+  the pass runs only on each sealed head. At 200 ms blocks a gap is taken in the next block.
 - **Priority fee:** `bid_policy` turns `[aero]` (`priority_fee_wei`, `bid_min_profit_usd`,
   `bid_share`, `bid_max_priority_wei`) into the `BidPolicy` that `ArbExecutor::terms` applies: a base
   priority fee, optionally a bid from a share of a large exact profit, re-checked at its own
   priority (Aero pools tax priority fees) and capped by the wallet balance.
 - **Journal:** JSON lines in `[aero] journal_path` (`aero_start`, `aero_venue`, `aero_tick`,
-  `aero_opp`, `aero_sent`, `aero_outcome`, `aero_cooldown`, `aero_learned`, `aero_same_block`);
-  without `contract` or without `--live` it only observes.
+  `aero_opp`, `aero_sent`, `aero_outcome`, `aero_cooldown`); without `contract` or without `--live`
+  it only observes.
 
 ## Plumbing
 
@@ -254,7 +249,7 @@ Aerodrome V2 and Slipstream pools) -> migrate -> sell new AERO (split over Aero 
 | `config` | arb-only config; `[[rpc]]` / `env_file` and `[exec]` are onchain-core's `RpcSettings` / `SendSettings` (URLs only from `.env`; a relative `kill_switch_file` or `env_file` is anchored at the config file's directory) |
 | `chain`, `num` (onchain-core) | Multicall3 reads, unit helpers |
 | `rpc` (onchain-core) | multi-endpoint pool: race / failover, per-endpoint method and log-range limits, lag handling; capacity errors matched by phrases (rate / plan / range limits), deterministic errors (revert, gas limit, insufficient funds, nonce...) never fail over; logs show endpoint names only |
-| `heads`, `flashblocks` (onchain-core) | new-head signal (WS `newHeads`, several endpoints); Base Flashblocks raw stream |
+| `heads` (onchain-core) | new-head signal (WS `newHeads`, several endpoints; reconnect backoff and endpoint parking) |
 | `executor`, `actor` (onchain-core) | keystore signing, broadcast to every endpoint (+ optional `extra_broadcast`) over warm connections, versioned per-wallet shared nonce file (`~/.local/state/onchain-bots/nonce-<wallet>`; fails closed: no lock or an unknown format = nothing sent), stuck-tx replacement, failure cooldown (`[exec] max_failures_in_window` within `failure_window_secs` pauses sending for `failure_cooldown_secs`); the executor as its own task. One arb in flight at a time here (`max_inflight` 1) |
 | `gates` (onchain-core) | kill switch, daily revert budget, deadlines, gas and L1-fee costs |
 | `runner` | the driver above |
@@ -267,10 +262,10 @@ Aerodrome V2 and Slipstream pools) -> migrate -> sell new AERO (split over Aero 
 
 1. Create `bot/src/<strategy>.rs` with a struct holding the strategy state and a constructor that
    validates its config section and does any one-time reads.
-2. Implement `OpportunitySource`: `on_block` for each sealed head, `on_flashblocks` if you have a
-   same-block mode (otherwise ignore the batch), `on_outcome` to account for your sent tx.
+2. Implement `OpportunitySource`: `on_block` for each sealed head, `on_outcome` to account for your
+   sent tx.
 3. Return `Err` only for fatal errors. Recoverable ones (an RPC hiccup, a failed quote) are logged.
-4. Call `runner::run(&mut strategy, provider, executor, heads, flashblocks, opts)` from `main.rs`.
+4. Call `runner::run(&mut strategy, provider, executor, heads, opts)` from `main.rs`.
 5. The runner test in `runner.rs` drives the driver with a mock strategy; copy it for yours.
 6. Send through `ArbExecutor` (see Aero's `tick`): build `Candidate`s, give it your `call` and a USD
    valuation, then `exact` -> `pick` -> `terms` -> `send` (with the `Gates`) on the `ExecHandle`.

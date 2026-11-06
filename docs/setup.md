@@ -34,8 +34,7 @@ cp .env.example .env    # then put your real URLs in it (the file is gitignored)
 RPC URLs carry API keys, so they live only in `.env`. Each `[[rpc]]` entry in the config names its
 variable with `http_env` (public endpoints may use `http` directly); logs and errors show only the
 endpoint `name`. `[aero] rpc` can pin the strategy to its own endpoints, in strict order, so it
-does not compete for quota with another bot on the same keys. Same-block mode needs an endpoint
-that supports `eth_simulateV1`.
+does not compete for quota with another bot on the same keys.
 
 ## 4. Config
 
@@ -44,7 +43,7 @@ cd bot
 cp config.example.toml config.local.toml   # gitignored
 ```
 
-Review `[[rpc]]`, `[exec]` (hot wallet address only, never a key), `[flashblocks]` and `[aero]`:
+Review `[[rpc]]`, `[exec]` (hot wallet address only, never a key) and `[aero]`:
 the Aero / legacy Aerodrome addresses (verify them on-chain; protocol migrations change them),
 `loan_tokens`, profit floors, priority fees, `funding` and, after deployment, `contract`. The
 example values are placeholders to make the bot start, not recommendations: size and price for

@@ -9,7 +9,7 @@ chain_id = 8453
 env_file = "../.env"
 
 [[rpc]]
-name = "primary"               # a keyed provider (eth_simulateV1 is needed for same-block mode)
+name = "primary"               # a keyed provider (archive recommended)
 http_env = "BASE_RPC_1"
 priority = 0
 ws = "derive"                  # derive the WS URL from the HTTP one (wss://...), for newHeads
@@ -42,16 +42,12 @@ eth_usd_fallback = 2400.0      # values gas and WETH-priced loans until an on-ch
 [router]
 # quoter_artifact = "../contracts/out/GridQuoter.sol/GridQuoter.json"   # `forge build` in contracts/
 
-[flashblocks]
-ws = "wss://mainnet.flashblocks.base.org/ws"   # same-block quoting ([aero] same_block)
-
 # Aero merger arbitrage, the example strategy: old AERO converts 1:1 into new AERO; when old trades
 # below new, buy old, migrate, sell new, repay, in one tx. Cross-check every address with Aero's
-# official list before going live.
+# official list before going live. The pass runs on each sealed head (Base Denim removed Flashblocks
+# and the in-progress state, so there is no same-block mode).
 [aero]
 # rpc = ["primary"]                  # endpoints for this strategy, in strict order (default: the pool)
-same_block = false                   # also quote + send on the in-progress block (Base flashblocks; needs eth_simulateV1)
-same_block_last_index = 6            # same-block passes only up to this flashblock index
 bid_min_profit_usd = 10.0            # exact profit at least this -> bid part of it as priority fee
 bid_share = 0.1                      # up to this share of the profit (never past net - floor); a bid is paid on a revert too
 bid_max_priority_wei = 100000000     # priority fee cap. Aero pools tax priority fees (MEV tax): check it before raising this

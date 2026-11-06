@@ -3,7 +3,7 @@
 
 use alloy::providers::ProviderBuilder;
 use anyhow::{Context, Result};
-use arbitrage_framework::{aero, config::Config, executor, flashblocks, heads, rpc};
+use arbitrage_framework::{aero, config::Config, executor, heads, rpc};
 use clap::Parser;
 use tracing::{info, warn};
 #[derive(Parser)]
@@ -88,8 +88,7 @@ async fn run(cfg: Config, live_signer: Option<alloy::signers::local::PrivateKeyS
         }
         None => None,
     };
-    let fb = cfg.aero.same_block.then(|| flashblocks::spawn_raw(cfg.flashblocks.ws.clone()));
-    aero::run(&cfg, provider, exec, heads, fb).await
+    aero::run(&cfg, provider, exec, heads).await
 }
 
 /// http://127.0.0.1:8545, http://localhost:..., ws://[::1]... (anvil forks).
